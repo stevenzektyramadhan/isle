@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackItem {
@@ -49,6 +50,7 @@ pub enum AudioCommand {
     PreviousTrack,
     SetVolume(f32),
     SetAutoplay(bool),
+    Seek(Duration),
     Enqueue(TrackItem),
     EnqueueBatch(Vec<TrackItem>),
     ClearQueue,

@@ -6,5 +6,9 @@
 .multibrain/
 AGENTS.md
 PRD.md
+.agents/
+.claude/
+.opencode/
+skills-lock.json
 
 

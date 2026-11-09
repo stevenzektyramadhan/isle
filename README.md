@@ -10,13 +10,17 @@ Aplikasi ini dirancang untuk mendengarkan lagu secara langsung tanpa browser, ta
 
 - **Pill / Island UI Mengambang**: Tampilan minimalis berukuran kecil (`160x36 dp` saat collapsed) yang *frameless*, *transparent*, dan *always-on-top*.
 - **Dashboard Interaktif**: Klik pada pill untuk memperluas menjadi dashboard (`360x130 dp`) dengan kendali penuh.
+- **Hallmark-Compliant Clean UI**: Desain antarmuka modern bebas emoji dengan palet warna semantik terpadu, glif geometris presisi, dan salinan status yang jujur tanpa metrik palsu.
+- **Interactive Seek Bar**: Geser atau klik langsung pada timeline bar untuk melompat (*seek*) ke posisi durasi tertentu secara real-time.
 - **Dukungan Berbagai Sumber Input**:
   - **YouTube**: Link video biasa, link Shorts, atau link playlist (`https://youtube.com/playlist?...`).
   - **Spotify**: Link lagu tunggal (`track`), album (`album`), hingga playlist lengkap (`playlist`).
   - **Pencarian Teks**: Cukup ketik judul lagu atau artis (misal: `Terpukau Astrid`) untuk langsung memutar hasil terbaik.
 - **Zero Disk Caching**: Audio distreaming langsung di dalam memori (`BufReader<reqwest::blocking::Response>` ke `rodio::Decoder`) tanpa menulis file sementara ke harddisk/SSD.
 - **Lazy Stream Resolution**: Playlist Spotify dan YouTube dimuat secara instan ke antrean; URL audio YouTube beresolusi tinggi hanya di-extract saat lagu tersebut giliran diputar.
-- **Auto Clipboard Listener**: Otomatis mendeteksi dan menawarkan pemutaran saat Anda menyalin link YouTube atau Spotify baru.
+- **Pintasan Keyboard Terintegrasi**: Kontrol pemutaran, volume, seek, dan perpindahan mode langsung dari keyboard tanpa menyentuh mouse.
+- **Quick Mute & Volume Control**: Slider volume halus dengan persentase tooltip serta klik langsung pada ikon speaker untuk mute/unmute instan.
+- **Queue Peek Tooltip**: Arahkan kursor ke tombol antrean untuk melihat preview 5 lagu berikutnya.
 - **Dukungan Media Keys / MPRIS**: Mendukung tombol keyboard play/pause, next, previous via `souvlaki` / MPRIS Linux.
 - **Posisi Window Persistent**: Posisi window di layar tersimpan otomatis di `~/.config/isle/config.json`.
 
@@ -31,7 +35,7 @@ Sebelum menjalankan atau meng-compile Isle, pastikan komputer Anda memiliki:
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
 2. **`yt-dlp`** (Wajib terpasang dan ada di `PATH`):
-   Isle menggunakan `yt-dlp` untuk mengekstrak URL stream audio dari YouTube.
+   Isle memanfaatkan utilitas media backend eksternal (`yt-dlp`) yang terpasang di sistem pengguna untuk menangani resolusi stream audio.
    ```bash
    # Di Arch Linux / Manjaro:
    sudo pacman -S yt-dlp
@@ -103,32 +107,44 @@ Di mode dashboard, Anda akan melihat kontrol lengkap:
 | **`▶` / `⏸` (Play / Pause)** | Memulai, menjeda, atau melanjutkan lagu yang sedang diputar. |
 | **`⏭` (Next)** | Melompati lagu yang sedang diputar ke lagu berikutnya di antrean. |
 | **`∞` `AUTO ON` / `AUTO OFF`** | **Autoplay Toggle**:<br>• **`AUTO ON`** (Ungu menyala): Saat lagu atau antrean habis, Isle akan otomatis mencari rekomendasi lagu serupa dan memutarnya tanpa henti.<br>• **`AUTO OFF`** (Gelap): Pemutaran berhenti setelah antrean lagu selesai. |
-| **`✕` `CLEAR` / `CLR (N)`** | **Clear Queue**:<br>• Menghapus seluruh daftar antrean lagu berikutnya.<br>• Label tombol menampilkan jumlah lagu di antrean, misalnya `CLR (4)` jika ada 4 lagu tersisa di antrean. |
-| **Seek Bar / Slider** | Geser penunjuk waktu untuk melompat (*seek*) ke menit tertentu pada lagu. |
-| **Kolom Input Teks** | Ketik judul lagu atau paste link YouTube/Spotify lalu tekan **Enter** untuk memutar. |
+| **`✕` `CLEAR` / `CLR (N)`** | **Clear Queue**:<br>• Menghapus seluruh daftar antrean lagu berikutnya.<br>• Label tombol menampilkan jumlah lagu di antrean, misalnya `CLR (4)`.<br>• Arahkan kursor (*hover*) untuk melihat preview 5 lagu berikutnya. |
+| **Seek Bar / Slider** | Klik atau geser penunjuk waktu untuk melompat (*seek*) langsung ke posisi durasi lagu. |
+| **Speaker & Volume Slider** | Klik ikon speaker untuk **Mute / Unmute** instan; geser slider volume untuk mengatur tingkat suara (dilengkapi persentase tooltip). |
+| **Kolom Input Teks & `×`** | Ketik judul lagu atau paste link YouTube/Spotify lalu tekan **Enter** atau tombol **`→`**. Klik tombol **`×`** untuk membersihkan kueri pencarian dengan sekali klik. |
+
+#### ⌨️ Pintasan Keyboard (Shortcuts)
+Saat kolom pencarian tidak sedang fokus mengetik, Anda dapat mengontrol Isle langsung melalui keyboard:
+
+| Shortcut | Aksi |
+|---|---|
+| **`Space`** | Play / Pause |
+| **`←` (Panah Kiri)** | Mundur (*seek backward*) 5 detik |
+| **`→` (Panah Kanan)** | Maju (*seek forward*) 5 detik |
+| **`↑` (Panah Atas)** | Naikkan volume +7.5% |
+| **`↓` (Panah Bawah)** | Turunkan volume -7.5% |
+| **`Esc`** | Menciutkan (*minimize*) Dashboard kembali ke Pill |
+| **`Ctrl + Shift + Space`** | Buka / tutup Dashboard dari mana saja di aplikasi |
 
 ---
 
 ## 🧠 Cara Kerja Aplikasi (Architecture)
 
-Isle dirancang dengan pendekatan modular dan *thread-safe*:
+Isle dirancang dengan arsitektur modular, *thread-safe*, dan hemat sumber daya:
 
 1. **Non-Blocking UI Thread (`src/ui.rs` & `src/main.rs`)**:
    - `eframe`/`egui` me-render antarmuka pada frame rate dinamis (hemat daya saat idle).
    - Thread antarmuka sama sekali tidak pernah menjalankan subprocess berat atau network call. Seluruh aksi dikirimkan melalui channel `std::sync::mpsc`.
 2. **Audio & Worker Thread (`src/audio.rs`)**:
    - Mengontrol audio engine `rodio` via sink.
-   - Mengelola antrean lagu (`VecDeque<TrackItem>`), volume, state playback, serta loop autoplay.
-3. **Stream & Metadata Extractor (`src/extractor.rs`)**:
-   - **YouTube**: Menggunakan `yt-dlp` untuk membaca flat playlist atau metadata, lalu mengekstrak stream URL (`-g -f ba`) secara instan.
-   - **Spotify**:
-     - Membaca metadata publik melalui halaman embed Spotify (`open.spotify.com/embed/{playlist|album|track}/{id}`).
-     - Mengambil struktur JSON Next.js untuk mendapatkan daftar lengkap track (*title*, *artist*, *duration*).
-     - Menjadwalkan pemutaran lagu tersebut ke YouTube Music/Audio secara cerdas menggunakan kueri YouTube Audio resmi (`ytsearch1:{title} {artist} Official Audio`).
-4. **Zero-Copy Streaming**:
-   - Aliran audio di-download secara chunk via `reqwest::blocking::Response` yang dibungkus `BufReader`, lalu langsung di-decode oleh `rodio::Decoder` langsung dari memori tanpa menyentuh disk/SSD sama sekali.
+   - Mengelola antrean lagu (`VecDeque<TrackItem>`), sinkronisasi volume, state playback, serta loop radio/autoplay otomatis.
+3. **Pluggable Metadata & Stream Resolver (`src/extractor.rs`)**:
+   - **Input Classification**: Mengklasifikasikan kueri input secara cerdas (URL media publik, playlist, atau teks pencarian artis/judul).
+   - **Delegated Stream Resolution**: Resolusi stream audio didelegasikan ke utilitas media eksternal yang tersedia di sistem pengguna, memisahkan logika aplikasi inti dari backend ekstraksi.
+   - **Lazy Loading**: Playlist dimuat secara instan sebagai antrean judul ringan; resolusi stream audio hanya dilakukan tepat saat track tersebut akan diputar untuk meminimalkan beban jaringan.
+4. **Zero Disk Caching**:
+   - Audio di-stream secara bertahap (*chunked memory stream*) via `BufReader` langsung ke decoder audio (`rodio::Decoder`) di RAM tanpa pernah menulis file sementara ke harddisk atau SSD.
 5. **Config & Memory Sync (`src/config.rs`)**:
-   - Konfigurasi window position dan volume disimpan di `~/.config/isle/config.json`.
+   - Pengaturan pengguna, tingkat volume, dan koordinat jendela disimpan secara persisten di `~/.config/isle/config.json`.
 
 ---
 

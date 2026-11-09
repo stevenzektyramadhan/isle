@@ -192,7 +192,15 @@ pub fn spawn_audio_worker(initial_config: AppConfig) -> (Sender<AudioCommand>, R
                 Ok(AudioCommand::Stop) => worker.stop(), Ok(AudioCommand::NextTrack) => worker.advance(),
                 Ok(AudioCommand::PreviousTrack) => if let Some(track) = pop_previous(&mut worker.state) { worker.activate(track); },
                 Ok(AudioCommand::SetVolume(volume)) => { apply_volume(&mut worker.state, volume); if let Some(sink) = worker.sink.as_ref() { sink.set_volume(worker.state.volume); } },
-                Ok(AudioCommand::SetAutoplay(enabled)) => worker.state.autoplay_enabled = enabled, Ok(AudioCommand::Enqueue(track)) => worker.state.queue.push_back(track),
+                Ok(AudioCommand::SetAutoplay(enabled)) => worker.state.autoplay_enabled = enabled,
+                Ok(AudioCommand::Seek(pos)) => {
+                    if let Some(sink) = worker.sink.as_ref() {
+                        if sink.try_seek(pos).is_ok() {
+                            worker.state.elapsed_secs = pos.as_secs();
+                        }
+                    }
+                },
+                Ok(AudioCommand::Enqueue(track)) => worker.state.queue.push_back(track),
                 Ok(AudioCommand::EnqueueBatch(tracks)) => worker.state.queue.extend(tracks), Ok(AudioCommand::ClearQueue) => worker.state.queue.clear(),
                 Ok(AudioCommand::ToggleWindowVisibility) => {}, Ok(AudioCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => { worker.stop(); running = false; },
                 Err(mpsc::RecvTimeoutError::Timeout) => {},
