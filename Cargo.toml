@@ -1,0 +1,14 @@
+[package]
+name = "isle"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+rodio = { version = "0.21", default-features = false, features = ["playback", "symphonia-all"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+souvlaki = "0.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
