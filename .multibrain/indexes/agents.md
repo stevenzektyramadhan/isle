@@ -10,6 +10,7 @@ Rules:
 
 ## Entries
 
+- 2026-11-09 17:05 WIB — Sisyphus: published initial release to GitHub (`stevenzektyramadhan/isle`) with complete README.md (architecture, buttons guide, usage, prereqs) and MIT LICENSE
 - 2026-11-09 16:45 WIB — Sisyphus: improved transport button clarity in `src/ui.rs` with explicit `AUTO ON`/`AUTO OFF` and `CLEAR`/`CLR (N)` labels, hover tooltips, and high-contrast active/inactive pill backgrounds (`#4c1d95` active vs `#141222` inactive)
 - 2026-11-09 16:35 WIB — Sisyphus: fixed Spotify playlist/album/track resolution in `src/extractor.rs` via Spotify embed `__NEXT_DATA__` (`trackList` + lazy `ytsearch1:{title} {artist} Official Audio` stream URLs) instead of searching playlist title via oEmbed
 - 2026-11-09 16:00 WIB — Sisyphus: fixed YouTube `tv_samsung` 403 Forbidden & throttling by using `--extractor-args "youtube:player_client=visionos,default"` + `Range: bytes=0-` header, and added UI `Searching…`/`Loading stream…` status updates

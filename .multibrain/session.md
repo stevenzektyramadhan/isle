@@ -10,4 +10,4 @@ Rules:
 
 ## Buckets
 
-- `agents` — shared notes for agent workflows, repository instructions, and Multi Brain setup. Last updated: 2026-11-09 16:45 WIB -> .multibrain/indexes/agents.md
+- `agents` — shared notes for agent workflows, repository instructions, and Multi Brain setup. Last updated: 2026-11-09 17:05 WIB -> .multibrain/indexes/agents.md
