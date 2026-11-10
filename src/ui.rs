@@ -1,5 +1,5 @@
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2, pos2, vec2};
 
@@ -120,15 +120,22 @@ fn paint_disc(painter: &egui::Painter, rect: Rect, anim_t: Option<f64>) {
 pub struct IsleApp {
     cmd_tx: Sender<AudioCommand>, state_rx: Receiver<PlayerState>, state: PlayerState,
     config: AppConfig, expanded: bool, search_query: String, last_window_pos: Option<Pos2>,
-    muted_volume: Option<f32>,
+    muted_volume: Option<f32>, last_config_save: Instant,
 }
 
 impl IsleApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, cmd_tx: Sender<AudioCommand>, state_rx: Receiver<PlayerState>, config: AppConfig) -> Self {
-        Self { cmd_tx, state_rx, state: PlayerState::default(), config, expanded: false, search_query: String::new(), last_window_pos: None, muted_volume: None }
+        Self { cmd_tx, state_rx, state: PlayerState::default(), config, expanded: false, search_query: String::new(), last_window_pos: None, muted_volume: None, last_config_save: Instant::now() }
     }
 
     fn resize(&self, ctx: &egui::Context, expanded: bool) { ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target_window_size(expanded))); }
+
+    fn save_config_debounced(&mut self) {
+        if self.last_config_save.elapsed() >= Duration::from_millis(500) {
+            let _ = crate::config::save_config(&self.config);
+            self.last_config_save = Instant::now();
+        }
+    }
 
     fn track_meta(&self) -> (String, String) {
         if !self.state.ytdlp_available { return ("yt-dlp missing".to_owned(), "Install yt-dlp in PATH".to_owned()); }
@@ -316,7 +323,7 @@ impl IsleApp {
                 let vol = ((pos.x - v_rect.left()) / v_rect.width()).clamp(0.0, 1.0) * 1.5;
                 self.state.volume = vol; self.config.volume = vol;
                 if vol > 0.001 { self.muted_volume = None; }
-                let _ = self.cmd_tx.send(AudioCommand::SetVolume(vol)); let _ = crate::config::save_config(&self.config);
+                let _ = self.cmd_tx.send(AudioCommand::SetVolume(vol)); self.save_config_debounced();
             }
         }
         let vol_pct = (self.state.volume / 1.5 * 100.0).round() as u32;
@@ -385,19 +392,19 @@ impl eframe::App for IsleApp {
                 self.state.volume = vol; self.config.volume = vol;
                 if vol > 0.001 { self.muted_volume = None; }
                 let _ = self.cmd_tx.send(AudioCommand::SetVolume(vol));
-                let _ = crate::config::save_config(&self.config);
+                self.save_config_debounced();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                 let vol = (self.state.volume - 0.075).clamp(0.0, 1.5);
                 self.state.volume = vol; self.config.volume = vol;
                 let _ = self.cmd_tx.send(AudioCommand::SetVolume(vol));
-                let _ = crate::config::save_config(&self.config);
+                self.save_config_debounced();
             }
         }
         if let Some(pos) = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)) {
             if self.last_window_pos != Some(pos) {
                 self.last_window_pos = Some(pos); self.config.window_x = Some(pos.x); self.config.window_y = Some(pos.y);
-                let _ = crate::config::save_config(&self.config);
+                self.save_config_debounced();
             }
         }
         egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {

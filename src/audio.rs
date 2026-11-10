@@ -83,7 +83,8 @@ struct AudioBackend { stream: OutputStream, client: reqwest::blocking::Client }
 
 impl AudioBackend {
     fn new() -> Option<Self> {
-        let client = reqwest::blocking::Client::builder().user_agent("Mozilla/5.0").connect_timeout(Duration::from_secs(10)).tcp_keepalive(Duration::from_secs(15)).timeout(None).build().ok()?;
+        // ponytail: per-request timeout caps each HTTP Range segment; HttpRangeReader reconnects on expiry
+        let client = reqwest::blocking::Client::builder().user_agent("Mozilla/5.0").connect_timeout(Duration::from_secs(10)).tcp_keepalive(Duration::from_secs(15)).timeout(Duration::from_secs(300)).build().ok()?;
         Some(Self { stream: OutputStreamBuilder::open_default_stream().ok()?, client })
     }
 }
@@ -121,7 +122,7 @@ fn start_track(track: &TrackItem, backend: Option<&AudioBackend>, volume: f32) -
     sink.set_volume(volume); sink.append(decoder); Some(sink)
 }
 
-struct Worker { state: PlayerState, sink: Option<Sink>, backend: Option<AudioBackend>, state_tx: Sender<PlayerState> }
+struct Worker { state: PlayerState, sink: Option<Sink>, backend: Option<AudioBackend>, state_tx: Sender<PlayerState>, consecutive_errors: u8 }
 
 impl Worker {
     fn activate(&mut self, track: TrackItem) {
@@ -129,10 +130,18 @@ impl Worker {
         self.state.current_track = Some(track.clone()); self.state.is_playing = false; self.state.elapsed_secs = 0;
         self.state.status_message = Some("Loading stream…".to_owned()); let _ = self.state_tx.send(self.state.clone());
         self.sink = start_track(&track, self.backend.as_ref(), self.state.volume);
-        self.state.is_playing = self.sink.is_some(); self.state.status_message = (!self.state.is_playing).then(|| "Stream failed".to_owned());
+        self.state.is_playing = self.sink.is_some();
+        if self.state.is_playing {
+            self.consecutive_errors = 0;
+            self.state.status_message = None;
+        } else {
+            self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+            self.state.status_message = Some("Stream failed".to_owned());
+        }
     }
 
     fn submit(&mut self, input: &str) {
+        self.consecutive_errors = 0;
         self.state.status_message = Some(format!("Searching {input}…")); let _ = self.state_tx.send(self.state.clone());
         if let Ok(tracks) = resolve_input(input) {
             let mut tracks = tracks.into_iter();
@@ -144,6 +153,11 @@ impl Worker {
     }
 
     fn advance(&mut self) {
+        if self.consecutive_errors >= 3 {
+            self.sink = None; self.state.is_playing = false; self.state.elapsed_secs = 0;
+            self.state.status_message = Some("Playback stopped: repeated errors".to_owned());
+            return;
+        }
         if let Some(track) = advance_queue(&mut self.state) { self.activate(track); return; }
         if self.state.autoplay_enabled {
             if let Some(last) = self.state.history.last().cloned() {
@@ -181,7 +195,7 @@ pub fn spawn_audio_worker(initial_config: AppConfig) -> (Sender<AudioCommand>, R
         state.autoplay_enabled = initial_config.autoplay_enabled;
         state.ytdlp_available = is_ytdlp_available();
         if state_tx.send(state.clone()).is_err() { return; }
-        let mut worker = Worker { state, sink: None, backend: AudioBackend::new(), state_tx: state_tx.clone() };
+        let mut worker = Worker { state, sink: None, backend: AudioBackend::new(), state_tx: state_tx.clone(), consecutive_errors: 0 };
         let mut media_keys = MediaKeyManager::new(media_tx);
         media_keys.sync_state(&worker.state);
         let mut running = true;
