@@ -1,10 +1,12 @@
 use std::{
     io::{ErrorKind, Read},
-    net::IpAddr,
+    net::{Ipv4Addr, Ipv6Addr},
     process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
+
+use url::{Host, Url};
 
 use crate::models::TrackItem;
 
@@ -48,16 +50,33 @@ pub enum InputKind {
     SpotifyUrl(String),
 }
 
-fn is_private_host(url: &str) -> bool {
-    let host = url.split("://").nth(1).and_then(|s| s.split('/').next()).and_then(|s| s.split(':').next()).unwrap_or("");
-    if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "0.0.0.0") { return true; }
-    if let Ok(ip) = host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
-        return match ip {
-            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified(),
-            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
+fn is_private_host(raw: &str) -> bool {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if !(normalized.starts_with("http://") || normalized.starts_with("https://")) { return false; }
+    let Ok(url) = Url::parse(&normalized) else { return true; };
+    let Some(host) = url.host() else { return true; };
+    match host {
+        Host::Domain(domain) => is_private_domain(domain),
+        Host::Ipv4(address) => is_private_ipv4(address),
+        Host::Ipv6(address) => is_private_ipv6(address),
     }
-    false
+}
+
+fn is_private_domain(domain: &str) -> bool {
+    let domain = domain.trim_end_matches('.');
+    domain == "localhost" || domain.ends_with(".localhost") || domain.ends_with(".local") || domain.ends_with(".internal")
+}
+
+fn is_private_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    address.is_loopback() || address.is_private() || address.is_link_local() || address.is_unspecified() || address.is_broadcast()
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+}
+
+fn is_private_ipv6(address: Ipv6Addr) -> bool {
+    if address.is_loopback() || address.is_unspecified() { return true; }
+    if let Some(mapped) = address.to_ipv4_mapped().or_else(|| address.to_ipv4()) { return is_private_ipv4(mapped); }
+    (address.segments()[0] & 0xfe00) == 0xfc00 || (address.segments()[0] & 0xffc0) == 0xfe80
 }
 
 pub fn classify_input(raw: &str) -> Result<InputKind, ExtractorError> {
@@ -354,6 +373,43 @@ mod tests {
         // Then: large playlists are truncated so loading stays bounded.
         let flags = playlist_flags();
         assert!(flags.windows(2).any(|pair| pair[0] == "--playlist-end" && pair[1] == "200"));
+    }
+
+    #[test]
+    fn rejects_private_hosts_after_url_normalization() {
+        for input in [
+            "http://[::1]/",
+            "http://x@127.0.0.1/",
+            "http://127.1/",
+            "http://2130706433/",
+            "http://LOCALHOST/",
+            "http://localhost./",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[fd00::1]/",
+            "http://169.254.169.254/",
+            "http://[fe80::1]/",
+            "http://100.64.0.1/",
+            "http://service.local/",
+            "http://metadata.google.internal/",
+            "http://10.1.2.3/",
+            "http://192.168.1.1/",
+        ] {
+            assert!(matches!(classify_input(input), Err(ExtractorError::PrivateNetwork)), "{input} should be rejected");
+        }
+    }
+
+    #[test]
+    fn allows_public_hosts_and_non_http_schemes() {
+        for input in [
+            "https://youtube.com/watch?v=abc",
+            "https://soundcloud.com/a/b",
+            "https://www.youtube.com/playlist?list=x",
+        ] {
+            assert!(!is_private_host(input), "{input} should pass");
+            assert!(!matches!(classify_input(input), Err(ExtractorError::PrivateNetwork)), "{input} should classify");
+        }
+        assert!(!is_private_host("spotify:track:abc"));
+        assert!(!is_private_host("spotify:playlist:abc"));
     }
 
     #[test]
