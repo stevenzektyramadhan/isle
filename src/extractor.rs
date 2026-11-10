@@ -242,13 +242,13 @@ fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<P
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill(); let _ = child.wait();
-                drop(join_pipe(stdout_reader)); drop(join_pipe(stderr_reader));
+                drop(stdout_reader); drop(stderr_reader);
                 return Err(ExtractorError::Timeout(timeout));
             }
             Ok(None) => thread::sleep(YTDLP_POLL_INTERVAL),
             Err(error) => {
                 let _ = child.kill(); let _ = child.wait();
-                drop(join_pipe(stdout_reader)); drop(join_pipe(stderr_reader));
+                drop(stdout_reader); drop(stderr_reader);
                 return Err(error.into());
             }
         }
