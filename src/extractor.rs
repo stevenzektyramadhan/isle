@@ -340,7 +340,7 @@ mod tests {
         // Given: a command that sleeps far longer than the watchdog window.
         let started = Instant::now();
         let mut command = Command::new("sh");
-        command.args(["-c", "sleep 5"]);
+        command.args(["-c", "exec sleep 5"]);
 
         // When: it is run with a short timeout.
         let result = run_command_with_timeout(command, Duration::from_millis(150));
@@ -348,6 +348,22 @@ mod tests {
         // Then: the watchdog kills it promptly and reports a timeout.
         assert!(matches!(result, Err(ExtractorError::Timeout(_))));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_returns_without_waiting_for_a_grandchild_holding_the_pipes() {
+        // Given: a shell that leaves a background child holding the inherited pipes.
+        let started = Instant::now();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5 & wait"]);
+
+        // When: the shell is killed by the watchdog.
+        let result = run_command_with_timeout(command, Duration::from_millis(150));
+
+        // Then: the watchdog returns without joining the still-open pipe readers.
+        assert!(matches!(result, Err(ExtractorError::Timeout(_))));
+        assert!(started.elapsed() < Duration::from_secs(2), "watchdog waited for the grandchild");
     }
 
     #[cfg(unix)]
