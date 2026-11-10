@@ -91,9 +91,7 @@ pub fn resolve_input(raw: &str) -> Result<Vec<TrackItem>, ExtractorError> {
     match classify_input(raw)? {
         InputKind::SearchQuery(query) => resolve_search(&query),
         InputKind::DirectUrl(url) => Ok(vec![resolve_metadata(&url)?]),
-        InputKind::YouTubePlaylist(url) => require_tracks(flat_tracks(&run_ytdlp(
-            &["--flat-playlist", "--print", FLAT_PLAYLIST_FORMAT], &url,
-        )?)),
+        InputKind::YouTubePlaylist(url) => require_tracks(flat_tracks(&run_ytdlp(&playlist_flags(), &url)?)),
         InputKind::SpotifyUrl(url) => resolve_spotify(&url),
     }
 }
@@ -192,6 +190,10 @@ fn spotify_track_item(entry: &serde_json::Value) -> Option<TrackItem> {
 
 fn flat_tracks(output: &str) -> Vec<TrackItem> {
     output.lines().filter_map(parse_flat_playlist_line).collect()
+}
+
+fn playlist_flags() -> [&'static str; 5] {
+    ["--flat-playlist", "--playlist-end", "200", "--print", FLAT_PLAYLIST_FORMAT]
 }
 
 fn require_tracks(tracks: Vec<TrackItem>) -> Result<Vec<TrackItem>, ExtractorError> {
@@ -344,6 +346,14 @@ mod tests {
         assert!(output.status.success());
         assert!(output.stdout.len() > 64 * 1024);
         assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "err");
+    }
+
+    #[test]
+    fn playlist_resolution_caps_entries_at_200() {
+        // Given/When: the flags used for playlist resolution.
+        // Then: large playlists are truncated so loading stays bounded.
+        let flags = playlist_flags();
+        assert!(flags.windows(2).any(|pair| pair[0] == "--playlist-end" && pair[1] == "200"));
     }
 
     #[test]
