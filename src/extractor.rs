@@ -16,7 +16,7 @@ const FLAT_PLAYLIST_FORMAT: &str = "%(id)s:::%(title)s:::%(url)s";
 const STREAM_FORMAT: &str =
     "ba[ext=m4a][protocol^=http]/ba[ext=mp3][protocol^=http]/ba[acodec^=vorbis][protocol^=http]/ba[protocol^=http]/ba";
 const SPOTIFY_OEMBED_URL: &str = "https://open.spotify.com/oembed";
-const YTDLP_TIMEOUT: Duration = Duration::from_secs(20);
+const YTDLP_TIMEOUT: Duration = Duration::from_secs(30);
 const YTDLP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const YTDLP_BASE_ARGS: &[&str] = &[
     "--no-config", "--socket-timeout", "10", "--retries", "1", "--extractor-retries", "1",
