@@ -152,12 +152,13 @@ impl Worker {
         } else { self.state.status_message = Some("No results found".to_owned()); }
     }
 
-    fn advance(&mut self) {
-        if self.consecutive_errors >= 3 {
+    fn advance(&mut self, automatic: bool) {
+        if automatic && self.consecutive_errors >= 3 {
             self.sink = None; self.state.is_playing = false; self.state.elapsed_secs = 0;
             self.state.status_message = Some("Playback stopped: repeated errors".to_owned());
             return;
         }
+        if !automatic { self.consecutive_errors = 0; }
         if let Some(track) = advance_queue(&mut self.state) { self.activate(track); return; }
         if self.state.autoplay_enabled {
             if let Some(last) = self.state.history.last().cloned() {
@@ -172,11 +173,16 @@ impl Worker {
         self.sink = None; self.state.is_playing = false; self.state.elapsed_secs = 0;
     }
 
+    fn previous(&mut self) {
+        self.consecutive_errors = 0;
+        if let Some(track) = pop_previous(&mut self.state) { self.activate(track); }
+    }
+
     fn toggle(&mut self) {
         if let Some(sink) = self.sink.as_ref() {
             if self.state.is_playing { sink.pause(); } else { sink.play(); }
             self.state.is_playing = !self.state.is_playing;
-        } else if let Some(track) = self.state.current_track.clone() { self.activate(track); } else { self.advance(); }
+        } else if let Some(track) = self.state.current_track.clone() { self.activate(track); } else { self.advance(false); }
     }
 
     fn stop(&mut self) {
@@ -203,8 +209,8 @@ pub fn spawn_audio_worker(initial_config: AppConfig) -> (Sender<AudioCommand>, R
             match cmd_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(AudioCommand::SubmitInput(input)) => worker.submit(&input),
                 Ok(AudioCommand::PlayTrack(track)) => worker.activate(track), Ok(AudioCommand::TogglePlayPause) => worker.toggle(),
-                Ok(AudioCommand::Stop) => worker.stop(), Ok(AudioCommand::NextTrack) => worker.advance(),
-                Ok(AudioCommand::PreviousTrack) => if let Some(track) = pop_previous(&mut worker.state) { worker.activate(track); },
+                Ok(AudioCommand::Stop) => worker.stop(), Ok(AudioCommand::NextTrack) => worker.advance(false),
+                Ok(AudioCommand::PreviousTrack) => worker.previous(),
                 Ok(AudioCommand::SetVolume(volume)) => { apply_volume(&mut worker.state, volume); if let Some(sink) = worker.sink.as_ref() { sink.set_volume(worker.state.volume); } },
                 Ok(AudioCommand::SetAutoplay(enabled)) => worker.state.autoplay_enabled = enabled,
                 Ok(AudioCommand::Seek(pos)) => {
@@ -221,7 +227,7 @@ pub fn spawn_audio_worker(initial_config: AppConfig) -> (Sender<AudioCommand>, R
             }
             if worker.state.is_playing { if let Some(sink) = worker.sink.as_ref() { worker.state.elapsed_secs = sink.get_pos().as_secs(); } }
             let completed = worker.state.is_playing && worker.sink.as_ref().is_some_and(Sink::empty);
-            if completed { worker.advance(); }
+            if completed { worker.advance(true); }
             media_keys.sync_state(&worker.state);
             if state_tx.send(worker.state.clone()).is_err() { break; }
         }
@@ -236,6 +242,42 @@ mod tests {
 
     fn track(track_id: &str) -> TrackItem {
         TrackItem { id: track_id.to_owned(), title: track_id.to_owned(), artist: None, original_url: format!("https://example.test/{track_id}"), duration_secs: None }
+    }
+
+    fn worker_with_queue(consecutive_errors: u8) -> Worker {
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut state = PlayerState::default();
+        state.queue.push_back(track("next"));
+        Worker { state, sink: None, backend: None, state_tx, consecutive_errors }
+    }
+
+    #[test]
+    fn repeated_error_guard_blocks_only_automatic_advance() {
+        let mut worker = worker_with_queue(3);
+        worker.advance(true);
+        assert_eq!(worker.state.queue.len(), 1);
+        assert_eq!(worker.state.current_track, None);
+        assert_eq!(worker.state.status_message.as_deref(), Some("Playback stopped: repeated errors"));
+    }
+
+    #[test]
+    fn manual_next_resets_the_error_guard_and_advances() {
+        let mut worker = worker_with_queue(3);
+        worker.advance(false);
+        assert_eq!(worker.consecutive_errors, 1);
+        assert!(worker.state.queue.is_empty());
+        assert_eq!(worker.state.current_track.as_ref().map(|track| track.id.as_str()), Some("next"));
+        assert_eq!(worker.state.status_message.as_deref(), Some("Stream failed"));
+    }
+
+    #[test]
+    fn manual_previous_resets_the_error_guard() {
+        let mut worker = worker_with_queue(3);
+        worker.state.current_track = Some(track("current"));
+        worker.state.history.push(track("previous"));
+        worker.previous();
+        assert_eq!(worker.consecutive_errors, 1);
+        assert_eq!(worker.state.current_track.as_ref().map(|track| track.id.as_str()), Some("previous"));
     }
 
     #[test]
