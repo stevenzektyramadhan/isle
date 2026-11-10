@@ -1,9 +1,12 @@
 use std::{
-    io::ErrorKind,
-    net::IpAddr,
-    process::{Command, Stdio},
-    time::Duration,
+    io::{ErrorKind, Read},
+    net::{Ipv4Addr, Ipv6Addr},
+    process::{Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
+
+use url::{Host, Url};
 
 use crate::models::TrackItem;
 
@@ -13,6 +16,11 @@ const FLAT_PLAYLIST_FORMAT: &str = "%(id)s:::%(title)s:::%(url)s";
 const STREAM_FORMAT: &str =
     "ba[ext=m4a][protocol^=http]/ba[ext=mp3][protocol^=http]/ba[acodec^=vorbis][protocol^=http]/ba[protocol^=http]/ba";
 const SPOTIFY_OEMBED_URL: &str = "https://open.spotify.com/oembed";
+const YTDLP_TIMEOUT: Duration = Duration::from_secs(30);
+const YTDLP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const YTDLP_BASE_ARGS: &[&str] = &[
+    "--no-config", "--socket-timeout", "10", "--retries", "1", "--extractor-retries", "1",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtractorError {
@@ -26,6 +34,8 @@ pub enum ExtractorError {
     SubprocessIo(#[from] std::io::Error),
     #[error("yt-dlp failed: {0}")]
     SubprocessFailed(String),
+    #[error("yt-dlp timed out after {0:?}")]
+    Timeout(Duration),
     #[error("HTTP request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("no tracks found")]
@@ -40,16 +50,33 @@ pub enum InputKind {
     SpotifyUrl(String),
 }
 
-fn is_private_host(url: &str) -> bool {
-    let host = url.split("://").nth(1).and_then(|s| s.split('/').next()).and_then(|s| s.split(':').next()).unwrap_or("");
-    if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "0.0.0.0") { return true; }
-    if let Ok(ip) = host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
-        return match ip {
-            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified(),
-            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
-        };
+fn is_private_host(raw: &str) -> bool {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if !(normalized.starts_with("http://") || normalized.starts_with("https://")) { return false; }
+    let Ok(url) = Url::parse(&normalized) else { return true; };
+    let Some(host) = url.host() else { return true; };
+    match host {
+        Host::Domain(domain) => is_private_domain(domain),
+        Host::Ipv4(address) => is_private_ipv4(address),
+        Host::Ipv6(address) => is_private_ipv6(address),
     }
-    false
+}
+
+fn is_private_domain(domain: &str) -> bool {
+    let domain = domain.trim_end_matches('.');
+    domain == "localhost" || domain.ends_with(".localhost") || domain.ends_with(".local") || domain.ends_with(".internal")
+}
+
+fn is_private_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    address.is_loopback() || address.is_private() || address.is_link_local() || address.is_unspecified() || address.is_broadcast()
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+}
+
+fn is_private_ipv6(address: Ipv6Addr) -> bool {
+    if address.is_loopback() || address.is_unspecified() { return true; }
+    if let Some(mapped) = address.to_ipv4_mapped().or_else(|| address.to_ipv4()) { return is_private_ipv4(mapped); }
+    (address.segments()[0] & 0xfe00) == 0xfc00 || (address.segments()[0] & 0xffc0) == 0xfe80
 }
 
 pub fn classify_input(raw: &str) -> Result<InputKind, ExtractorError> {
@@ -83,9 +110,7 @@ pub fn resolve_input(raw: &str) -> Result<Vec<TrackItem>, ExtractorError> {
     match classify_input(raw)? {
         InputKind::SearchQuery(query) => resolve_search(&query),
         InputKind::DirectUrl(url) => Ok(vec![resolve_metadata(&url)?]),
-        InputKind::YouTubePlaylist(url) => require_tracks(flat_tracks(&run_ytdlp(
-            &["--flat-playlist", "--print", FLAT_PLAYLIST_FORMAT], &url,
-        )?)),
+        InputKind::YouTubePlaylist(url) => require_tracks(flat_tracks(&run_ytdlp(&playlist_flags(), &url)?)),
         InputKind::SpotifyUrl(url) => resolve_spotify(&url),
     }
 }
@@ -186,24 +211,60 @@ fn flat_tracks(output: &str) -> Vec<TrackItem> {
     output.lines().filter_map(parse_flat_playlist_line).collect()
 }
 
+fn playlist_flags() -> [&'static str; 5] {
+    ["--flat-playlist", "--playlist-end", "200", "--print", FLAT_PLAYLIST_FORMAT]
+}
+
 fn require_tracks(tracks: Vec<TrackItem>) -> Result<Vec<TrackItem>, ExtractorError> {
     if tracks.is_empty() { Err(ExtractorError::NoResults) } else { Ok(tracks) }
+}
+
+struct ProcessOutput { status: ExitStatus, stdout: Vec<u8>, stderr: Vec<u8> }
+
+fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> Option<thread::JoinHandle<Vec<u8>>> {
+    pipe.map(|mut pipe| thread::spawn(move || { let mut buffer = Vec::new(); let _ = pipe.read_to_end(&mut buffer); buffer }))
+}
+
+fn join_pipe(reader: Option<thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
+    reader.and_then(|reader| reader.join().ok()).unwrap_or_default()
+}
+
+/// Run a command with a hard wall-clock deadline. Output pipes are drained on
+/// background threads so a chatty child cannot deadlock on a full pipe buffer.
+fn run_command_with_timeout(mut command: Command, timeout: Duration) -> Result<ProcessOutput, ExtractorError> {
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout_reader = drain_pipe(child.stdout.take());
+    let stderr_reader = drain_pipe(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill(); let _ = child.wait();
+                drop(stdout_reader); drop(stderr_reader);
+                return Err(ExtractorError::Timeout(timeout));
+            }
+            Ok(None) => thread::sleep(YTDLP_POLL_INTERVAL),
+            Err(error) => {
+                let _ = child.kill(); let _ = child.wait();
+                drop(stdout_reader); drop(stderr_reader);
+                return Err(error.into());
+            }
+        }
+    };
+    Ok(ProcessOutput { status, stdout: join_pipe(stdout_reader), stderr: join_pipe(stderr_reader) })
 }
 
 /// Run yt-dlp with hardened defaults. `target` is the positional arg (URL/query)
 /// inserted after a `--` delimiter to prevent flag injection.
 fn run_ytdlp(flags: &[&str], target: &str) -> Result<String, ExtractorError> {
-    let output = match Command::new("yt-dlp")
-        .args(["--no-config", "--socket-timeout", "10"])
-        .args(flags)
-        .arg("--")
-        .arg(target)
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Err(ExtractorError::MissingBinary),
-        Err(error) => return Err(error.into()),
-    };
+    let mut command = Command::new("yt-dlp");
+    command.args(YTDLP_BASE_ARGS).args(flags).arg("--").arg(target);
+    let output = run_command_with_timeout(command, YTDLP_TIMEOUT).map_err(|error| match error {
+        ExtractorError::SubprocessIo(io_error) if io_error.kind() == ErrorKind::NotFound => ExtractorError::MissingBinary,
+        other => other,
+    })?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
@@ -263,6 +324,108 @@ mod tests {
         assert!(matches!(classify_input("https://localhost/stream"), Err(ExtractorError::PrivateNetwork)));
         assert!(matches!(classify_input("http://192.168.1.1/audio"), Err(ExtractorError::PrivateNetwork)));
         assert!(matches!(classify_input("http://10.0.0.1/audio"), Err(ExtractorError::PrivateNetwork)));
+    }
+
+    #[test]
+    fn ytdlp_base_args_enable_single_retry_and_extractor_retry() {
+        // Given/When: the hardened base arguments used for every yt-dlp call.
+        // Then: retries stay capped so failures are bounded by the watchdog.
+        assert!(YTDLP_BASE_ARGS.windows(2).any(|pair| pair[0] == "--retries" && pair[1] == "1"));
+        assert!(YTDLP_BASE_ARGS.windows(2).any(|pair| pair[0] == "--extractor-retries" && pair[1] == "1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_kills_a_command_that_outlives_the_timeout() {
+        // Given: a command that sleeps far longer than the watchdog window.
+        let started = Instant::now();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 5"]);
+
+        // When: it is run with a short timeout.
+        let result = run_command_with_timeout(command, Duration::from_millis(150));
+
+        // Then: the watchdog kills it promptly and reports a timeout.
+        assert!(matches!(result, Err(ExtractorError::Timeout(_))));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_returns_without_waiting_for_a_grandchild_holding_the_pipes() {
+        // Given: a shell that leaves a background child holding the inherited pipes.
+        let started = Instant::now();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5 & wait"]);
+
+        // When: the shell is killed by the watchdog.
+        let result = run_command_with_timeout(command, Duration::from_millis(150));
+
+        // Then: the watchdog returns without joining the still-open pipe readers.
+        assert!(matches!(result, Err(ExtractorError::Timeout(_))));
+        assert!(started.elapsed() < Duration::from_secs(2), "watchdog waited for the grandchild");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captures_output_larger_than_the_pipe_buffer_without_deadlock() {
+        // Given: a command that writes far more than the OS pipe buffer to stdout.
+        let script = "i=0; while [ $i -lt 5000 ]; do echo 0123456789012345678901234567890123456789012345678901234567890123; i=$((i+1)); done; echo err >&2";
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+
+        // When: it is run through the watchdog-aware helper.
+        let output = run_command_with_timeout(command, Duration::from_secs(10)).expect("command should complete");
+
+        // Then: both streams are drained fully instead of blocking the child.
+        assert!(output.status.success());
+        assert!(output.stdout.len() > 64 * 1024);
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "err");
+    }
+
+    #[test]
+    fn playlist_resolution_caps_entries_at_200() {
+        // Given/When: the flags used for playlist resolution.
+        // Then: large playlists are truncated so loading stays bounded.
+        let flags = playlist_flags();
+        assert!(flags.windows(2).any(|pair| pair[0] == "--playlist-end" && pair[1] == "200"));
+    }
+
+    #[test]
+    fn rejects_private_hosts_after_url_normalization() {
+        for input in [
+            "http://[::1]/",
+            "http://x@127.0.0.1/",
+            "http://127.1/",
+            "http://2130706433/",
+            "http://LOCALHOST/",
+            "http://localhost./",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[fd00::1]/",
+            "http://169.254.169.254/",
+            "http://[fe80::1]/",
+            "http://100.64.0.1/",
+            "http://service.local/",
+            "http://metadata.google.internal/",
+            "http://10.1.2.3/",
+            "http://192.168.1.1/",
+        ] {
+            assert!(matches!(classify_input(input), Err(ExtractorError::PrivateNetwork)), "{input} should be rejected");
+        }
+    }
+
+    #[test]
+    fn allows_public_hosts_and_non_http_schemes() {
+        for input in [
+            "https://youtube.com/watch?v=abc",
+            "https://soundcloud.com/a/b",
+            "https://www.youtube.com/playlist?list=x",
+        ] {
+            assert!(!is_private_host(input), "{input} should pass");
+            assert!(!matches!(classify_input(input), Err(ExtractorError::PrivateNetwork)), "{input} should classify");
+        }
+        assert!(!is_private_host("spotify:track:abc"));
+        assert!(!is_private_host("spotify:playlist:abc"));
     }
 
     #[test]
