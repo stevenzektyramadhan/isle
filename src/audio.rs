@@ -1,6 +1,6 @@
 use std::{io::{self, BufReader, Read, Seek, SeekFrom}, sync::mpsc::{self, Receiver, Sender}, time::Duration};
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink};
-use crate::{extractor::{canonical_title, fetch_related_tracks, is_ytdlp_available, resolve_input, resolve_stream_url}, media_keys::MediaKeyManager, models::{AppConfig, AudioCommand, PlayerState, TrackItem}};
+use crate::{extractor::{canonical_title, fetch_related_tracks, is_ytdlp_available, resolve_input, resolve_stream_url, ExtractorError}, media_keys::MediaKeyManager, models::{AppConfig, AudioCommand, PlayerState, TrackItem}};
 
 const MAX_BUFFER_BYTES: usize = 256 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -124,6 +124,16 @@ fn start_track(track: &TrackItem, backend: Option<&AudioBackend>, volume: f32) -
 
 struct Worker { state: PlayerState, sink: Option<Sink>, backend: Option<AudioBackend>, state_tx: Sender<PlayerState>, consecutive_errors: u8 }
 
+fn submit_error_message(error: &ExtractorError) -> &'static str {
+    match error {
+        ExtractorError::Timeout(_) => "yt-dlp timed out",
+        ExtractorError::MissingBinary => "yt-dlp not found",
+        ExtractorError::PrivateNetwork => "Local/private addresses are blocked",
+        ExtractorError::NoResults => "No results found",
+        _ => "Could not load input",
+    }
+}
+
 impl Worker {
     fn activate(&mut self, track: TrackItem) {
         if let Some(sink) = self.sink.take() { sink.stop(); }
@@ -143,13 +153,16 @@ impl Worker {
     fn submit(&mut self, input: &str) {
         self.consecutive_errors = 0;
         self.state.status_message = Some(format!("Searching {input}…")); let _ = self.state_tx.send(self.state.clone());
-        if let Ok(tracks) = resolve_input(input) {
-            let mut tracks = tracks.into_iter();
-            if let Some(track) = tracks.next() {
-                if let Some(prev) = self.state.current_track.take() { self.state.history.push(prev); }
-                self.state.queue.clear(); self.state.queue.extend(tracks); self.activate(track);
+        match resolve_input(input) {
+            Ok(tracks) => {
+                let mut tracks = tracks.into_iter();
+                if let Some(track) = tracks.next() {
+                    if let Some(prev) = self.state.current_track.take() { self.state.history.push(prev); }
+                    self.state.queue.clear(); self.state.queue.extend(tracks); self.activate(track);
+                }
             }
-        } else { self.state.status_message = Some("No results found".to_owned()); }
+            Err(error) => self.state.status_message = Some(submit_error_message(&error).to_owned()),
+        }
     }
 
     fn advance(&mut self, automatic: bool) {
@@ -249,6 +262,17 @@ mod tests {
         let mut state = PlayerState::default();
         state.queue.push_back(track("next"));
         Worker { state, sink: None, backend: None, state_tx, consecutive_errors }
+    }
+
+    #[test]
+    fn submit_error_messages_are_specific_and_safe() {
+        let timeout = ExtractorError::Timeout(Duration::from_secs(30));
+        assert_eq!(submit_error_message(&timeout), "yt-dlp timed out");
+        assert_eq!(submit_error_message(&ExtractorError::MissingBinary), "yt-dlp not found");
+        assert_eq!(submit_error_message(&ExtractorError::PrivateNetwork), "Local/private addresses are blocked");
+        assert_eq!(submit_error_message(&ExtractorError::NoResults), "No results found");
+        assert_eq!(submit_error_message(&ExtractorError::EmptyInput), "Could not load input");
+        assert_eq!(submit_error_message(&ExtractorError::SubprocessFailed("raw yt-dlp output".to_owned())), "Could not load input");
     }
 
     #[test]
