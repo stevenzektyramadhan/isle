@@ -1,5 +1,6 @@
 use std::{
     io::ErrorKind,
+    net::IpAddr,
     process::{Command, Stdio},
     time::Duration,
 };
@@ -19,6 +20,8 @@ pub enum ExtractorError {
     MissingBinary,
     #[error("input is empty")]
     EmptyInput,
+    #[error("private/loopback addresses are not allowed")]
+    PrivateNetwork,
     #[error("yt-dlp I/O error: {0}")]
     SubprocessIo(#[from] std::io::Error),
     #[error("yt-dlp failed: {0}")]
@@ -37,6 +40,18 @@ pub enum InputKind {
     SpotifyUrl(String),
 }
 
+fn is_private_host(url: &str) -> bool {
+    let host = url.split("://").nth(1).and_then(|s| s.split('/').next()).and_then(|s| s.split(':').next()).unwrap_or("");
+    if matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "0.0.0.0") { return true; }
+    if let Ok(ip) = host.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified(),
+            IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        };
+    }
+    false
+}
+
 pub fn classify_input(raw: &str) -> Result<InputKind, ExtractorError> {
     let input = raw.trim();
     if input.is_empty() {
@@ -44,6 +59,7 @@ pub fn classify_input(raw: &str) -> Result<InputKind, ExtractorError> {
     }
     let value = input.to_owned();
     if input.starts_with("http://") || input.starts_with("https://") || input.starts_with("spotify:") {
+        if is_private_host(input) { return Err(ExtractorError::PrivateNetwork); }
         if input.contains("open.spotify.com") || input.starts_with("spotify:") {
             Ok(InputKind::SpotifyUrl(value))
         } else if input.contains("list=") || input.contains("/playlist") {
@@ -67,15 +83,15 @@ pub fn resolve_input(raw: &str) -> Result<Vec<TrackItem>, ExtractorError> {
     match classify_input(raw)? {
         InputKind::SearchQuery(query) => resolve_search(&query),
         InputKind::DirectUrl(url) => Ok(vec![resolve_metadata(&url)?]),
-        InputKind::YouTubePlaylist(url) => require_tracks(flat_tracks(&run_ytdlp(&[
-            "--flat-playlist", "--print", FLAT_PLAYLIST_FORMAT, &url,
-        ])?)),
+        InputKind::YouTubePlaylist(url) => require_tracks(flat_tracks(&run_ytdlp(
+            &["--flat-playlist", "--print", FLAT_PLAYLIST_FORMAT], &url,
+        )?)),
         InputKind::SpotifyUrl(url) => resolve_spotify(&url),
     }
 }
 
 pub fn resolve_stream_url(original_url: &str) -> Result<String, ExtractorError> {
-    run_ytdlp(&["--extractor-args", "youtube:player_client=visionos,default", "-g", "-f", STREAM_FORMAT, "--no-playlist", original_url])?
+    run_ytdlp(&["--extractor-args", "youtube:player_client=visionos,default", "-g", "-f", STREAM_FORMAT, "--no-playlist"], original_url)?
         .lines().find(|line| !line.trim().is_empty()).map(ToOwned::to_owned).ok_or(ExtractorError::NoResults)
 }
 
@@ -91,9 +107,9 @@ pub fn canonical_title(title: &str) -> String {
 
 pub fn fetch_related_tracks(last_track: &TrackItem) -> Result<Vec<TrackItem>, ExtractorError> {
     let mix = format!("https://www.youtube.com/watch?v={}&list=RD{}", last_track.id, last_track.id);
-    let raw = run_ytdlp(&["--flat-playlist", "-I", "2:10", "--print", SEARCH_METADATA_FORMAT, &mix]).or_else(|_| {
+    let raw = run_ytdlp(&["--flat-playlist", "-I", "2:10", "--print", SEARCH_METADATA_FORMAT], &mix).or_else(|_| {
         let seed = last_track.artist.as_deref().unwrap_or(&last_track.title);
-        run_ytdlp(&["--flat-playlist", "--match-filter", "live_status!=is_live", "--print", SEARCH_METADATA_FORMAT, &format!("ytsearch6:{seed} audio")])
+        run_ytdlp(&["--flat-playlist", "--match-filter", "live_status!=is_live", "--print", SEARCH_METADATA_FORMAT], &format!("ytsearch6:{seed} audio"))
     })?;
     let mut seen = vec![canonical_title(&last_track.title)];
     let tracks = raw.lines().filter_map(parse_metadata_line).filter(|track| {
@@ -106,12 +122,12 @@ pub fn fetch_related_tracks(last_track: &TrackItem) -> Result<Vec<TrackItem>, Ex
 }
 
 fn resolve_search(query: &str) -> Result<Vec<TrackItem>, ExtractorError> {
-    run_ytdlp(&["--flat-playlist", "--match-filter", "live_status!=is_live", "--print", SEARCH_METADATA_FORMAT, &format!("ytsearch3:{query}")])?
+    run_ytdlp(&["--flat-playlist", "--match-filter", "live_status!=is_live", "--print", SEARCH_METADATA_FORMAT], &format!("ytsearch3:{query}"))?
         .lines().find_map(parse_metadata_line).map(|track| vec![track]).ok_or(ExtractorError::NoResults)
 }
 
 fn resolve_metadata(target: &str) -> Result<TrackItem, ExtractorError> {
-    run_ytdlp(&["--no-playlist", "--print", METADATA_FORMAT, target])?
+    run_ytdlp(&["--no-playlist", "--print", METADATA_FORMAT], target)?
         .lines().find_map(parse_metadata_line).ok_or(ExtractorError::NoResults)
 }
 
@@ -134,7 +150,10 @@ pub fn parse_spotify_resource(url: &str) -> Option<(&str, &str)> {
     let rest = clean.strip_prefix("spotify:").or_else(|| clean.split("open.spotify.com/").nth(1))?;
     let mut parts = rest.split(['/', ':']).filter(|s| !s.is_empty() && *s != "embed" && !s.starts_with("intl-"));
     let (kind, id) = (parts.next()?, parts.next()?);
-    matches!(kind, "track" | "playlist" | "album").then_some((kind, id))
+    matches!(kind, "track" | "playlist" | "album")
+        .then_some(())
+        .filter(|_| id.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(|_| (kind, id))
 }
 
 pub fn parse_spotify_embed_tracks(html: &str) -> Option<Vec<TrackItem>> {
@@ -171,8 +190,16 @@ fn require_tracks(tracks: Vec<TrackItem>) -> Result<Vec<TrackItem>, ExtractorErr
     if tracks.is_empty() { Err(ExtractorError::NoResults) } else { Ok(tracks) }
 }
 
-fn run_ytdlp(args: &[&str]) -> Result<String, ExtractorError> {
-    let output = match Command::new("yt-dlp").args(args).output() {
+/// Run yt-dlp with hardened defaults. `target` is the positional arg (URL/query)
+/// inserted after a `--` delimiter to prevent flag injection.
+fn run_ytdlp(flags: &[&str], target: &str) -> Result<String, ExtractorError> {
+    let output = match Command::new("yt-dlp")
+        .args(["--no-config", "--socket-timeout", "10"])
+        .args(flags)
+        .arg("--")
+        .arg(target)
+        .output()
+    {
         Ok(output) => output,
         Err(error) if error.kind() == ErrorKind::NotFound => return Err(ExtractorError::MissingBinary),
         Err(error) => return Err(error.into()),
@@ -231,6 +258,11 @@ mod tests {
         assert!(matches!(classify_input("https://open.spotify.com/track/abc"), Ok(InputKind::SpotifyUrl(_))));
         assert!(matches!(classify_input("spotify:track:abc"), Ok(InputKind::SpotifyUrl(_))));
         assert!(matches!(classify_input("  \n"), Err(ExtractorError::EmptyInput)));
+        assert!(matches!(classify_input("http://127.0.0.1:8080/stream"), Err(ExtractorError::PrivateNetwork)));
+        assert!(matches!(classify_input("http://127.0.0.1:8080/playlist?list=123"), Err(ExtractorError::PrivateNetwork)));
+        assert!(matches!(classify_input("https://localhost/stream"), Err(ExtractorError::PrivateNetwork)));
+        assert!(matches!(classify_input("http://192.168.1.1/audio"), Err(ExtractorError::PrivateNetwork)));
+        assert!(matches!(classify_input("http://10.0.0.1/audio"), Err(ExtractorError::PrivateNetwork)));
     }
 
     #[test]
@@ -260,6 +292,8 @@ mod tests {
         assert_eq!(parse_spotify_resource("https://open.spotify.com/playlist/0MN6xHeLC01zApGeng8IrZ?si=abc"), Some(("playlist", "0MN6xHeLC01zApGeng8IrZ")));
         assert_eq!(parse_spotify_resource("https://open.spotify.com/intl-id/track/7tL?si=1"), Some(("track", "7tL")));
         assert_eq!(parse_spotify_resource("spotify:album:xyz"), Some(("album", "xyz")));
+        assert_eq!(parse_spotify_resource("spotify:track:../../../etc"), None);
+        assert_eq!(parse_spotify_resource("spotify:track:a b"), None);
         let html = r#"<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"trackList":[{"uri":"spotify:track:t1","title":"Terpukau","subtitle":"Astrid","duration":257706},{"uri":"spotify:track:t2","title":"Sesi Potret","subtitle":"eńau,\u00a0Ari Lesmana","duration":274000}]}}}}}}</script>"#;
         let tracks = parse_spotify_embed_tracks(html).unwrap();
         assert_eq!((tracks.len(), tracks[0].id.as_str(), tracks[0].title.as_str(), tracks[0].artist.as_deref(), tracks[0].original_url.as_str(), tracks[0].duration_secs, tracks[1].artist.as_deref()), (2, "t1", "Terpukau", Some("Astrid"), "ytsearch1:Terpukau Astrid Official Audio", Some(257), Some("eńau, Ari Lesmana")));

@@ -47,7 +47,11 @@ pub fn save_config_to(path: &Path, config: &AppConfig) -> Result<(), ConfigError
     let mut normalized_config = config.clone();
     normalized_config.volume = normalized_config.clamped_volume();
     let serialized = serde_json::to_string_pretty(&normalized_config)?;
-    fs::write(path, serialized)?;
+
+    // ponytail: atomic via tmp+rename; upgrade to tempfile crate if cross-fs needed
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serialized)?;
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
