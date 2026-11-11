@@ -10,12 +10,18 @@ pub struct MediaKeyManager {
 
 impl MediaKeyManager {
     pub fn new(cmd_tx: Sender<AudioCommand>) -> Self {
-        let config = PlatformConfig { dbus_name: "isle", display_name: "Isle", hwnd: None };
+        let config = PlatformConfig {
+            dbus_name: "isle",
+            display_name: "Isle",
+            hwnd: None,
+        };
         let controls = match MediaControls::new(config) {
             Ok(mut controls) => {
                 let attached = controls.attach(move |event| {
                     let command = match event {
-                        MediaControlEvent::Play | MediaControlEvent::Pause | MediaControlEvent::Toggle => Some(AudioCommand::TogglePlayPause),
+                        MediaControlEvent::Play
+                        | MediaControlEvent::Pause
+                        | MediaControlEvent::Toggle => Some(AudioCommand::TogglePlayPause),
                         MediaControlEvent::Next => Some(AudioCommand::NextTrack),
                         MediaControlEvent::Previous => Some(AudioCommand::PreviousTrack),
                         MediaControlEvent::Stop => Some(AudioCommand::Stop),
@@ -25,7 +31,11 @@ impl MediaKeyManager {
                         let _ = cmd_tx.send(command);
                     }
                 });
-                if attached.is_ok() { Some(controls) } else { None }
+                if attached.is_ok() {
+                    Some(controls)
+                } else {
+                    None
+                }
             }
             Err(_) => None,
         };
@@ -39,7 +49,9 @@ impl MediaKeyManager {
                 let metadata = MediaMetadata {
                     title: track.map(|item| item.title.as_str()),
                     artist: track.and_then(|item| item.artist.as_deref()),
-                    duration: track.and_then(|item| item.duration_secs).map(Duration::from_secs),
+                    duration: track
+                        .and_then(|item| item.duration_secs)
+                        .map(Duration::from_secs),
                     ..Default::default()
                 };
                 let playback = match (track.is_some(), state.is_playing) {
