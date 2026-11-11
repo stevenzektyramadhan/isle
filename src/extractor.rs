@@ -14,12 +14,12 @@ const METADATA_FORMAT: &str = "%(id)s:::%(title)s:::%(uploader)s:::%(webpage_url
 const SEARCH_METADATA_FORMAT: &str = "%(id)s:::%(title)s:::%(uploader)s:::%(url)s:::%(duration)s";
 const FLAT_PLAYLIST_FORMAT: &str = "%(id)s:::%(title)s:::%(url)s";
 const STREAM_FORMAT: &str =
-    "ba[ext=m4a][protocol^=http]/ba[ext=mp3][protocol^=http]/ba[acodec^=vorbis][protocol^=http]/ba[protocol^=http]/ba";
+    "ba[ext=m4a][protocol^=http]/ba[ext=mp3][protocol^=http]/ba[acodec^=vorbis][protocol^=http]/ba[protocol^=http]/ba/b[protocol^=http]/b";
 const SPOTIFY_OEMBED_URL: &str = "https://open.spotify.com/oembed";
 const YTDLP_TIMEOUT: Duration = Duration::from_secs(30);
 const YTDLP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const YTDLP_BASE_ARGS: &[&str] = &[
-    "--no-config", "--socket-timeout", "10", "--retries", "1", "--extractor-retries", "1",
+    "--socket-timeout", "10", "--retries", "1", "--extractor-retries", "1",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -115,9 +115,133 @@ pub fn resolve_input(raw: &str) -> Result<Vec<TrackItem>, ExtractorError> {
     }
 }
 
+pub const BROWSER_CANDIDATES: &[&str] = &["firefox", "brave", "chrome", "chromium"];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamInfo {
+    pub url: String,
+    pub user_agent: Option<String>,
+    pub browser_used: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct YtdlpStreamJson {
+    url: Option<String>,
+    http_headers: Option<std::collections::HashMap<String, String>>,
+}
+
+pub fn parse_stream_json(raw: &str) -> Option<StreamInfo> {
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('{') {
+            if let Ok(data) = serde_json::from_str::<YtdlpStreamJson>(trimmed) {
+                if let Some(url) = data.url.filter(|u| !u.trim().is_empty()) {
+                    let user_agent = data.http_headers.and_then(|mut headers| {
+                        headers.remove("User-Agent").or_else(|| headers.remove("user-agent"))
+                    });
+                    return Some(StreamInfo { url, user_agent, browser_used: None });
+                }
+            }
+        }
+    }
+    raw.lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("http://") || line.starts_with("https://"))
+        .map(|url| StreamInfo {
+            url: url.to_owned(),
+            user_agent: None,
+            browser_used: None,
+        })
+}
+
+/// Must stay cookie-free: yt-dlp skips the `visionos` client whenever cookies
+/// are supplied, then falls back to a WEB_EMBEDDED_PLAYER URL that 403s on Range.
+fn primary_stream_flags() -> [&'static str; 6] {
+    [
+        "-j", "-f", STREAM_FORMAT, "--no-playlist",
+        "--extractor-args", "youtube:player_client=visionos,default",
+    ]
+}
+
+/// `c=TVHTML5` URLs answer Range requests with 403.
+fn is_usable_stream_url(url: &str) -> bool {
+    !url.contains("c=TVHTML5")
+}
+
+pub fn resolve_stream_info(original_url: &str, cookies_browser: Option<&str>) -> Result<StreamInfo, ExtractorError> {
+    let mut last_error = None;
+
+    let flags = primary_stream_flags();
+    match run_ytdlp(&flags, original_url) {
+        Ok(output) => {
+            if let Some(info) = parse_stream_json(&output) {
+                if is_usable_stream_url(&info.url) {
+                    return Ok(info);
+                }
+            }
+        }
+        Err(e) => last_error = Some(e),
+    }
+
+    if let Some(browser) = cookies_browser {
+        let flags = ["-j", "-f", STREAM_FORMAT, "--no-playlist", "--cookies-from-browser", browser];
+        match run_ytdlp(&flags, original_url) {
+            Ok(output) => {
+                if let Some(mut info) = parse_stream_json(&output) {
+                    if is_usable_stream_url(&info.url) {
+                        info.browser_used = Some(browser.to_owned());
+                        return Ok(info);
+                    }
+                }
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    for &candidate in BROWSER_CANDIDATES {
+        if cookies_browser == Some(candidate) {
+            continue;
+        }
+        let flags = ["-j", "-f", STREAM_FORMAT, "--no-playlist", "--cookies-from-browser", candidate];
+        match run_ytdlp(&flags, original_url) {
+            Ok(output) => {
+                if let Some(mut info) = parse_stream_json(&output) {
+                    if is_usable_stream_url(&info.url) {
+                        info.browser_used = Some(candidate.to_owned());
+                        return Ok(info);
+                    }
+                }
+            }
+            Err(e) => {
+                let is_missing_browser = match &e {
+                    ExtractorError::SubprocessFailed(msg) => {
+                        let lower = msg.to_ascii_lowercase();
+                        lower.contains("could not find") && lower.contains("cookies")
+                    }
+                    _ => false,
+                };
+                if !is_missing_browser {
+                    last_error = Some(e);
+                }
+            }
+        }
+    }
+
+    let fallback_flags = [
+        "--extractor-args", "youtube:player_client=android,web",
+        "-j", "-f", STREAM_FORMAT, "--no-playlist",
+    ];
+    if let Ok(output) = run_ytdlp(&fallback_flags, original_url) {
+        if let Some(info) = parse_stream_json(&output) {
+            return Ok(info);
+        }
+    }
+
+    Err(last_error.unwrap_or(ExtractorError::NoResults))
+}
+
 pub fn resolve_stream_url(original_url: &str) -> Result<String, ExtractorError> {
-    run_ytdlp(&["--extractor-args", "youtube:player_client=visionos,default", "-g", "-f", STREAM_FORMAT, "--no-playlist"], original_url)?
-        .lines().find(|line| !line.trim().is_empty()).map(ToOwned::to_owned).ok_or(ExtractorError::NoResults)
+    resolve_stream_info(original_url, None).map(|info| info.url)
 }
 
 pub fn canonical_title(title: &str) -> String {
@@ -460,5 +584,49 @@ mod tests {
         let html = r#"<script id="__NEXT_DATA__" type="application/json">{"props":{"pageProps":{"state":{"data":{"entity":{"trackList":[{"uri":"spotify:track:t1","title":"Terpukau","subtitle":"Astrid","duration":257706},{"uri":"spotify:track:t2","title":"Sesi Potret","subtitle":"eńau,\u00a0Ari Lesmana","duration":274000}]}}}}}}</script>"#;
         let tracks = parse_spotify_embed_tracks(html).unwrap();
         assert_eq!((tracks.len(), tracks[0].id.as_str(), tracks[0].title.as_str(), tracks[0].artist.as_deref(), tracks[0].original_url.as_str(), tracks[0].duration_secs, tracks[1].artist.as_deref()), (2, "t1", "Terpukau", Some("Astrid"), "ytsearch1:Terpukau Astrid Official Audio", Some(257), Some("eńau, Ari Lesmana")));
+    }
+
+    #[test]
+    fn primary_stream_attempt_requests_visionos_and_never_sends_cookies() {
+        // Given/When: the flags used for the first, cookie-free resolution attempt.
+        let flags = primary_stream_flags();
+
+        // Then: the visionos client is requested, matching the pre-regression main path.
+        assert!(flags.windows(2).any(|pair| {
+            pair[0] == "--extractor-args" && pair[1] == "youtube:player_client=visionos,default"
+        }));
+        assert!(flags.windows(2).any(|pair| pair[0] == "-f" && pair[1] == STREAM_FORMAT));
+        assert!(flags.contains(&"-j") && flags.contains(&"--no-playlist"));
+
+        // And: no cookie flag is present, because yt-dlp skips visionos when cookies are supplied.
+        assert!(!flags.iter().any(|flag| flag.contains("cookies")));
+    }
+
+    #[test]
+    fn rejects_only_tvhtml5_stream_urls() {
+        // Given: googlevideo URLs from different player clients.
+        let tvhtml5 = "https://rr1---sn-x.googlevideo.com/videoplayback?id=a&c=TVHTML5&n=b";
+        let visionos = "https://rr1---sn-x.googlevideo.com/videoplayback?id=a&c=VISIONOS&n=b";
+        let embedded = "https://rr1---sn-x.googlevideo.com/videoplayback?id=a&c=WEB_EMBEDDED_PLAYER&n=b";
+
+        // When/Then: only the TVHTML5 URL is rejected; the rest pass the resolver's filter.
+        assert!(!is_usable_stream_url(tvhtml5));
+        assert!(is_usable_stream_url(visionos));
+        assert!(is_usable_stream_url(embedded));
+    }
+
+    #[test]
+    fn parses_stream_json_with_user_agent_and_fallback_line() {
+        let json = r#"{"url":"https://example.com/audio.webm","http_headers":{"User-Agent":"Custom/1.0"}}"#;
+        let info = parse_stream_json(json).expect("should parse json");
+        assert_eq!(info.url, "https://example.com/audio.webm");
+        assert_eq!(info.user_agent.as_deref(), Some("Custom/1.0"));
+        assert_eq!(info.browser_used, None);
+
+        let plain = "https://example.com/plain.m4a\n";
+        let info2 = parse_stream_json(plain).expect("should parse plain url");
+        assert_eq!(info2.url, "https://example.com/plain.m4a");
+        assert_eq!(info2.user_agent, None);
+        assert_eq!(info2.browser_used, None);
     }
 }

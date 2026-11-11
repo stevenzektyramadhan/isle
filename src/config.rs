@@ -91,6 +91,7 @@ mod tests {
             window_y: Some(240.0),
             volume: 0.75,
             autoplay_enabled: false,
+            cookies_browser: None,
         };
 
         // When: the configuration is saved then loaded.
