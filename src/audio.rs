@@ -15,6 +15,7 @@ use std::{
 
 const MAX_BUFFER_BYTES: usize = 256 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
+const MAX_AUTOMATIC_FAILURES: u8 = 3;
 
 pub struct MemoryStreamReader<R: Read> {
     reader: BufReader<R>,
@@ -149,6 +150,18 @@ struct AudioBackend {
     client: reqwest::blocking::Client,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum StartError {
+    #[error("no audio output device is available")]
+    NoAudioDevice,
+    #[error("stream resolution failed")]
+    Resolve(#[from] ExtractorError),
+    #[error("stream HTTP connection failed")]
+    HttpConnect,
+    #[error("stream decoding failed")]
+    Decode,
+}
+
 impl AudioBackend {
     fn new() -> Option<Self> {
         // ponytail: per-request timeout caps each HTTP Range segment; HttpRangeReader reconnects on expiry
@@ -180,26 +193,16 @@ impl HttpRangeReader {
         client: &reqwest::blocking::Client,
         url: String,
         user_agent: Option<String>,
-    ) -> Option<Self> {
+    ) -> Result<Self, reqwest::Error> {
         let mut req = client.get(&url).header("Range", "bytes=0-");
         if let Some(ua) = &user_agent {
             req = req.header("User-Agent", ua);
         }
-        let response = match req
+        let response = req
             .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-        {
-            Ok(resp) => resp,
-            Err(err) => {
-                eprintln!(
-                    "[isle] Stream HTTP Range connection failed: {}",
-                    err.without_url()
-                );
-                return None;
-            }
-        };
+            .and_then(reqwest::blocking::Response::error_for_status)?;
         let total_len = response.content_length();
-        Some(Self {
+        Ok(Self {
             client: client.clone(),
             url,
             user_agent,
@@ -249,48 +252,81 @@ fn start_track(
     backend: Option<&AudioBackend>,
     volume: f32,
     cookies_browser: &mut Option<String>,
-) -> Option<Sink> {
-    let backend = backend?;
+) -> Result<Sink, StartError> {
+    let backend = match backend {
+        Some(backend) => backend,
+        None => {
+            eprintln!("[isle] Audio output device is unavailable");
+            return Err(StartError::NoAudioDevice);
+        }
+    };
     let mut resolved = resolve_stream_info(&track.original_url, cookies_browser.as_deref());
     if resolved.is_err() && !track.original_url.starts_with("ytsearch") {
+        eprintln!("[isle] Stream resolution failed; trying search fallback");
         let fallback = format!("ytsearch1:{} Official Audio", track.title);
-        eprintln!("[isle] Stream resolution failed; trying search fallback: {fallback}");
         resolved = resolve_stream_info(&fallback, cookies_browser.as_deref());
     }
     let stream_info = match resolved {
         Ok(info) => info,
         Err(err) => {
             eprintln!(
-                "[isle] Stream resolution failed for {}: {err}",
-                track.original_url
+                "[isle] Stream resolution failed: {}",
+                resolve_diagnostic(&err)
             );
-            return None;
+            return Err(StartError::Resolve(err));
         }
     };
     let mut detected_browser = stream_info.browser_used.clone();
     let mut reader =
-        HttpRangeReader::open(&backend.client, stream_info.url, stream_info.user_agent);
+        match HttpRangeReader::open(&backend.client, stream_info.url, stream_info.user_agent) {
+            Ok(reader) => Some(reader),
+            Err(err) => {
+                eprintln!(
+                    "[isle] Stream HTTP Range connection failed: {}",
+                    err.without_url()
+                );
+                None
+            }
+        };
     if reader.is_none() && !track.original_url.starts_with("ytsearch") {
         eprintln!("[isle] Initial HTTP range stream failed; trying search fallback");
         let fallback = format!("ytsearch1:{} Official Audio", track.title);
-        if let Ok(info) = resolve_stream_info(&fallback, cookies_browser.as_deref()) {
-            detected_browser = info.browser_used.clone();
-            reader = HttpRangeReader::open(&backend.client, info.url, info.user_agent);
+        match resolve_stream_info(&fallback, cookies_browser.as_deref()) {
+            Ok(info) => {
+                detected_browser = info.browser_used.clone();
+                reader = match HttpRangeReader::open(&backend.client, info.url, info.user_agent) {
+                    Ok(reader) => Some(reader),
+                    Err(err) => {
+                        eprintln!(
+                            "[isle] Search fallback HTTP connection failed: {}",
+                            err.without_url()
+                        );
+                        None
+                    }
+                };
+            }
+            Err(err) => eprintln!(
+                "[isle] Search fallback resolution failed: {}",
+                resolve_diagnostic(&err)
+            ),
         }
     }
-    let reader = reader?;
+    let reader = reader.ok_or(StartError::HttpConnect)?;
     if cookies_browser.is_none() && detected_browser.is_some() {
-        eprintln!(
-            "[isle] Auto-detected working browser cookies: {:?}",
-            detected_browser
-        );
+        eprintln!("[isle] Auto-detected usable browser cookie source");
         *cookies_browser = detected_browser;
     }
-    let decoder = decode_stream(BufReader::new(reader))?;
+    let decoder = match decode_stream(BufReader::new(reader)) {
+        Some(decoder) => decoder,
+        None => {
+            eprintln!("[isle] Stream decoder rejected the response format");
+            return Err(StartError::Decode);
+        }
+    };
     let sink = Sink::connect_new(backend.stream.mixer());
     sink.set_volume(volume);
     sink.append(decoder);
-    Some(sink)
+    Ok(sink)
 }
 
 struct Worker {
@@ -312,8 +348,31 @@ fn submit_error_message(error: &ExtractorError) -> &'static str {
     }
 }
 
+fn resolve_diagnostic(error: &ExtractorError) -> &'static str {
+    match error {
+        ExtractorError::MissingBinary => "yt-dlp is unavailable",
+        ExtractorError::EmptyInput => "input is empty",
+        ExtractorError::PrivateNetwork => "input is blocked",
+        ExtractorError::SubprocessIo(_) => "yt-dlp I/O failed",
+        ExtractorError::SubprocessFailed(_) => "yt-dlp exited unsuccessfully",
+        ExtractorError::Timeout(_) => "yt-dlp timed out",
+        ExtractorError::Http(_) => "resolver HTTP request failed",
+        ExtractorError::NoResults => "no stream result",
+    }
+}
+
+fn start_error_message(error: &StartError) -> &'static str {
+    match error {
+        StartError::NoAudioDevice => "No audio device",
+        StartError::Resolve(ExtractorError::MissingBinary) => "yt-dlp not found",
+        StartError::Resolve(ExtractorError::Timeout(_)) => "Resolve timed out",
+        StartError::Resolve(_) | StartError::HttpConnect => "Stream HTTP error",
+        StartError::Decode => "Unsupported audio format",
+    }
+}
+
 impl Worker {
-    fn activate(&mut self, track: TrackItem) {
+    fn activate(&mut self, track: TrackItem) -> bool {
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
@@ -322,19 +381,26 @@ impl Worker {
         self.state.elapsed_secs = 0;
         self.state.status_message = Some("Loading stream…".to_owned());
         let _ = self.state_tx.send(self.state.clone());
-        self.sink = start_track(
+        match start_track(
             &track,
             self.backend.as_ref(),
             self.state.volume,
             &mut self.cookies_browser,
-        );
-        self.state.is_playing = self.sink.is_some();
-        if self.state.is_playing {
-            self.consecutive_errors = 0;
-            self.state.status_message = None;
-        } else {
-            self.consecutive_errors = self.consecutive_errors.saturating_add(1);
-            self.state.status_message = Some("Stream failed".to_owned());
+        ) {
+            Ok(sink) => {
+                self.sink = Some(sink);
+                self.state.is_playing = true;
+                self.consecutive_errors = 0;
+                self.state.status_message = None;
+                true
+            }
+            Err(error) => {
+                self.sink = None;
+                self.state.is_playing = false;
+                self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+                self.state.status_message = Some(start_error_message(&error).to_owned());
+                false
+            }
         }
     }
 
@@ -359,41 +425,57 @@ impl Worker {
     }
 
     fn advance(&mut self, automatic: bool) {
-        if automatic && self.consecutive_errors >= 3 {
-            self.sink = None;
-            self.state.is_playing = false;
-            self.state.elapsed_secs = 0;
-            self.state.status_message = Some("Playback stopped: repeated errors".to_owned());
-            return;
-        }
         if !automatic {
             self.consecutive_errors = 0;
+            if let Some(track) = advance_queue(&mut self.state) {
+                self.activate(track);
+                return;
+            }
         }
-        if let Some(track) = advance_queue(&mut self.state) {
-            self.activate(track);
-            return;
-        }
-        if self.state.autoplay_enabled {
-            if let Some(last) = self.state.history.last().cloned() {
-                self.state.status_message = Some("Loading radio mix…".to_owned());
-                let _ = self.state_tx.send(self.state.clone());
-                if let Ok(related) = fetch_related_tracks(&last) {
-                    let fresh = related.into_iter().filter(|t| {
-                        !self.state.history.iter().any(|h| {
-                            h.id == t.id || canonical_title(&h.title) == canonical_title(&t.title)
-                        })
-                    });
-                    self.state.queue.extend(fresh);
-                    if let Some(track) = advance_queue(&mut self.state) {
-                        self.activate(track);
-                        return;
+
+        let mut loaded_radio_mix = false;
+        loop {
+            if automatic && self.consecutive_errors >= MAX_AUTOMATIC_FAILURES {
+                self.sink = None;
+                self.state.is_playing = false;
+                self.state.elapsed_secs = 0;
+                self.state.status_message = Some("Playback stopped: repeated errors".to_owned());
+                return;
+            }
+            if let Some(track) = advance_queue(&mut self.state) {
+                if self.activate(track) || !automatic {
+                    return;
+                }
+                continue;
+            }
+            if !loaded_radio_mix && self.state.autoplay_enabled {
+                loaded_radio_mix = true;
+                if let Some(last) = self.state.history.last().cloned() {
+                    self.state.status_message = Some("Loading radio mix…".to_owned());
+                    let _ = self.state_tx.send(self.state.clone());
+                    if let Ok(related) = fetch_related_tracks(&last) {
+                        let fresh = related.into_iter().filter(|t| {
+                            !self.state.history.iter().any(|h| {
+                                h.id == t.id
+                                    || canonical_title(&h.title) == canonical_title(&t.title)
+                            })
+                        });
+                        self.state.queue.extend(fresh);
+                        if !automatic {
+                            if let Some(track) = advance_queue(&mut self.state) {
+                                self.activate(track);
+                            }
+                            return;
+                        }
+                        continue;
                     }
                 }
             }
+            self.sink = None;
+            self.state.is_playing = false;
+            self.state.elapsed_secs = 0;
+            return;
         }
-        self.sink = None;
-        self.state.is_playing = false;
-        self.state.elapsed_secs = 0;
     }
 
     fn previous(&mut self) {
@@ -457,7 +539,9 @@ pub fn spawn_audio_worker(
         while running {
             match cmd_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(AudioCommand::SubmitInput(input)) => worker.submit(&input),
-                Ok(AudioCommand::PlayTrack(track)) => worker.activate(track),
+                Ok(AudioCommand::PlayTrack(track)) => {
+                    worker.activate(track);
+                }
                 Ok(AudioCommand::TogglePlayPause) => worker.toggle(),
                 Ok(AudioCommand::Stop) => worker.stop(),
                 Ok(AudioCommand::NextTrack) => worker.advance(false),
@@ -520,10 +604,12 @@ mod tests {
         }
     }
 
-    fn worker_with_queue(consecutive_errors: u8) -> Worker {
+    fn worker_with_tracks(consecutive_errors: u8, track_ids: &[&str]) -> Worker {
         let (state_tx, _state_rx) = mpsc::channel();
         let mut state = PlayerState::default();
-        state.queue.push_back(track("next"));
+        state
+            .queue
+            .extend(track_ids.iter().map(|track_id| track(track_id)));
         Worker {
             state,
             sink: None,
@@ -532,6 +618,10 @@ mod tests {
             consecutive_errors,
             cookies_browser: None,
         }
+    }
+
+    fn worker_with_queue(consecutive_errors: u8) -> Worker {
+        worker_with_tracks(consecutive_errors, &["next"])
     }
 
     #[test]
@@ -575,6 +665,83 @@ mod tests {
     }
 
     #[test]
+    fn start_track_without_backend_returns_no_audio_device() {
+        let mut cookies_browser = None;
+
+        assert!(matches!(
+            start_track(&track("current"), None, 1.0, &mut cookies_browser),
+            Err(StartError::NoAudioDevice)
+        ));
+        assert_eq!(cookies_browser, None);
+    }
+
+    #[test]
+    fn backend_none_reports_no_audio_device_status() {
+        let mut worker = worker_with_queue(0);
+        worker.activate(track("current"));
+
+        assert!(!worker.state.is_playing);
+        assert_eq!(
+            worker.state.status_message.as_deref(),
+            Some("No audio device")
+        );
+    }
+
+    #[test]
+    fn startup_error_messages_are_short_and_specific() {
+        let errors = [
+            (StartError::NoAudioDevice, "No audio device"),
+            (
+                StartError::Resolve(ExtractorError::MissingBinary),
+                "yt-dlp not found",
+            ),
+            (
+                StartError::Resolve(ExtractorError::Timeout(Duration::from_secs(30))),
+                "Resolve timed out",
+            ),
+            (
+                StartError::Resolve(ExtractorError::SubprocessFailed(
+                    "raw yt-dlp stderr".to_owned(),
+                )),
+                "Stream HTTP error",
+            ),
+            (StartError::HttpConnect, "Stream HTTP error"),
+            (StartError::Decode, "Unsupported audio format"),
+        ];
+
+        for (error, message) in errors {
+            assert_eq!(start_error_message(&error), message);
+            assert!(message.len() <= 32);
+        }
+    }
+
+    #[test]
+    fn automatic_advance_skips_three_failures_and_leaves_the_fourth_queued() {
+        let mut worker = worker_with_tracks(0, &["one", "two", "three", "four"]);
+        worker.advance(true);
+
+        assert_eq!(worker.consecutive_errors, 3);
+        assert_eq!(
+            worker.state.queue.front().map(|track| track.id.as_str()),
+            Some("four")
+        );
+        assert_eq!(worker.state.queue.len(), 1);
+        assert_eq!(
+            worker
+                .state
+                .current_track
+                .as_ref()
+                .map(|track| track.id.as_str()),
+            Some("three")
+        );
+        assert!(!worker.state.is_playing);
+        assert_eq!(
+            worker.state.status_message.as_deref(),
+            Some("Playback stopped: repeated errors")
+        );
+    }
+
+    #[test]
     fn manual_next_resets_the_error_guard_and_advances() {
         let mut worker = worker_with_queue(3);
         worker.advance(false);
@@ -590,7 +757,7 @@ mod tests {
         );
         assert_eq!(
             worker.state.status_message.as_deref(),
-            Some("Stream failed")
+            Some("No audio device")
         );
     }
 
@@ -608,6 +775,26 @@ mod tests {
                 .as_ref()
                 .map(|track| track.id.as_str()),
             Some("previous")
+        );
+        assert_eq!(
+            worker.state.status_message.as_deref(),
+            Some("No audio device")
+        );
+    }
+
+    #[test]
+    fn submit_resets_the_error_guard_and_reports_a_safe_status() {
+        let mut worker = worker_with_queue(3);
+        worker.submit("");
+
+        assert_eq!(worker.consecutive_errors, 0);
+        assert_eq!(
+            worker.state.status_message.as_deref(),
+            Some("Could not load input")
+        );
+        assert_eq!(
+            worker.state.queue.front().map(|track| track.id.as_str()),
+            Some("next")
         );
     }
 
