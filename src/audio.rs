@@ -1,6 +1,6 @@
 use std::{io::{self, BufReader, Read, Seek, SeekFrom}, sync::mpsc::{self, Receiver, Sender}, time::Duration};
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink};
-use crate::{extractor::{canonical_title, fetch_related_tracks, is_ytdlp_available, resolve_input, resolve_stream_url, ExtractorError}, media_keys::MediaKeyManager, models::{AppConfig, AudioCommand, PlayerState, TrackItem}};
+use crate::{extractor::{canonical_title, fetch_related_tracks, is_ytdlp_available, resolve_input, resolve_stream_info, ExtractorError}, media_keys::MediaKeyManager, models::{AppConfig, AudioCommand, PlayerState, TrackItem}};
 
 const MAX_BUFFER_BYTES: usize = 256 * 1024;
 const READ_CHUNK_BYTES: usize = 8 * 1024;
@@ -89,13 +89,30 @@ impl AudioBackend {
     }
 }
 
-struct HttpRangeReader { client: reqwest::blocking::Client, url: String, response: reqwest::blocking::Response, pos: u64, total_len: Option<u64> }
+struct HttpRangeReader {
+    client: reqwest::blocking::Client,
+    url: String,
+    user_agent: Option<String>,
+    response: reqwest::blocking::Response,
+    pos: u64,
+    total_len: Option<u64>,
+}
 
 impl HttpRangeReader {
-    fn open(client: &reqwest::blocking::Client, url: String) -> Option<Self> {
-        let response = client.get(&url).header("Range", "bytes=0-").send().ok()?.error_for_status().ok()?;
+    fn open(client: &reqwest::blocking::Client, url: String, user_agent: Option<String>) -> Option<Self> {
+        let mut req = client.get(&url).header("Range", "bytes=0-");
+        if let Some(ua) = &user_agent {
+            req = req.header("User-Agent", ua);
+        }
+        let response = match req.send().and_then(reqwest::blocking::Response::error_for_status) {
+            Ok(resp) => resp,
+            Err(err) => {
+                eprintln!("[isle] Stream HTTP Range connection failed: {}", err.without_url());
+                return None;
+            }
+        };
         let total_len = response.content_length();
-        Some(Self { client: client.clone(), url, response, pos: 0, total_len })
+        Some(Self { client: client.clone(), url, user_agent, response, pos: 0, total_len })
     }
 }
 
@@ -105,7 +122,11 @@ impl Read for HttpRangeReader {
             if count > 0 || self.total_len.is_none_or(|len| self.pos >= len) { self.pos += count as u64; return Ok(count); }
         }
         let range = format!("bytes={}-", self.pos);
-        self.response = self.client.get(&self.url).header("Range", range).send().and_then(reqwest::blocking::Response::error_for_status).map_err(io::Error::other)?;
+        let mut req = self.client.get(&self.url).header("Range", range);
+        if let Some(ua) = &self.user_agent {
+            req = req.header("User-Agent", ua);
+        }
+        self.response = req.send().and_then(reqwest::blocking::Response::error_for_status).map_err(io::Error::other)?;
         let count = self.response.read(buf)?; self.pos += count as u64; Ok(count)
     }
 }
@@ -114,15 +135,54 @@ pub fn decode_stream<R: Read + Send + Sync + 'static>(reader: BufReader<R>) -> O
     Decoder::builder().with_data(MemoryStreamReader::new(reader)).with_seekable(false).with_hint("m4a").build().ok()
 }
 
-fn start_track(track: &TrackItem, backend: Option<&AudioBackend>, volume: f32) -> Option<Sink> {
+fn start_track(
+    track: &TrackItem,
+    backend: Option<&AudioBackend>,
+    volume: f32,
+    cookies_browser: &mut Option<String>,
+) -> Option<Sink> {
     let backend = backend?;
-    let reader = HttpRangeReader::open(&backend.client, resolve_stream_url(&track.original_url).ok()?)?;
+    let mut resolved = resolve_stream_info(&track.original_url, cookies_browser.as_deref());
+    if resolved.is_err() && !track.original_url.starts_with("ytsearch") {
+        let fallback = format!("ytsearch1:{} Official Audio", track.title);
+        eprintln!("[isle] Stream resolution failed; trying search fallback: {fallback}");
+        resolved = resolve_stream_info(&fallback, cookies_browser.as_deref());
+    }
+    let stream_info = match resolved {
+        Ok(info) => info,
+        Err(err) => {
+            eprintln!("[isle] Stream resolution failed for {}: {err}", track.original_url);
+            return None;
+        }
+    };
+    let mut detected_browser = stream_info.browser_used.clone();
+    let mut reader = HttpRangeReader::open(&backend.client, stream_info.url, stream_info.user_agent);
+    if reader.is_none() && !track.original_url.starts_with("ytsearch") {
+        eprintln!("[isle] Initial HTTP range stream failed; trying search fallback");
+        let fallback = format!("ytsearch1:{} Official Audio", track.title);
+        if let Ok(info) = resolve_stream_info(&fallback, cookies_browser.as_deref()) {
+            detected_browser = info.browser_used.clone();
+            reader = HttpRangeReader::open(&backend.client, info.url, info.user_agent);
+        }
+    }
+    let reader = reader?;
+    if cookies_browser.is_none() && detected_browser.is_some() {
+        eprintln!("[isle] Auto-detected working browser cookies: {:?}", detected_browser);
+        *cookies_browser = detected_browser;
+    }
     let decoder = decode_stream(BufReader::new(reader))?;
     let sink = Sink::connect_new(backend.stream.mixer());
     sink.set_volume(volume); sink.append(decoder); Some(sink)
 }
 
-struct Worker { state: PlayerState, sink: Option<Sink>, backend: Option<AudioBackend>, state_tx: Sender<PlayerState>, consecutive_errors: u8 }
+struct Worker {
+    state: PlayerState,
+    sink: Option<Sink>,
+    backend: Option<AudioBackend>,
+    state_tx: Sender<PlayerState>,
+    consecutive_errors: u8,
+    cookies_browser: Option<String>,
+}
 
 fn submit_error_message(error: &ExtractorError) -> &'static str {
     match error {
@@ -139,7 +199,7 @@ impl Worker {
         if let Some(sink) = self.sink.take() { sink.stop(); }
         self.state.current_track = Some(track.clone()); self.state.is_playing = false; self.state.elapsed_secs = 0;
         self.state.status_message = Some("Loading stream…".to_owned()); let _ = self.state_tx.send(self.state.clone());
-        self.sink = start_track(&track, self.backend.as_ref(), self.state.volume);
+        self.sink = start_track(&track, self.backend.as_ref(), self.state.volume, &mut self.cookies_browser);
         self.state.is_playing = self.sink.is_some();
         if self.state.is_playing {
             self.consecutive_errors = 0;
@@ -214,7 +274,8 @@ pub fn spawn_audio_worker(initial_config: AppConfig) -> (Sender<AudioCommand>, R
         state.autoplay_enabled = initial_config.autoplay_enabled;
         state.ytdlp_available = is_ytdlp_available();
         if state_tx.send(state.clone()).is_err() { return; }
-        let mut worker = Worker { state, sink: None, backend: AudioBackend::new(), state_tx: state_tx.clone(), consecutive_errors: 0 };
+        let cookies_browser = initial_config.cookies_browser.clone();
+        let mut worker = Worker { state, sink: None, backend: AudioBackend::new(), state_tx: state_tx.clone(), consecutive_errors: 0, cookies_browser };
         let mut media_keys = MediaKeyManager::new(media_tx);
         media_keys.sync_state(&worker.state);
         let mut running = true;
@@ -261,7 +322,7 @@ mod tests {
         let (state_tx, _state_rx) = mpsc::channel();
         let mut state = PlayerState::default();
         state.queue.push_back(track("next"));
-        Worker { state, sink: None, backend: None, state_tx, consecutive_errors }
+        Worker { state, sink: None, backend: None, state_tx, consecutive_errors, cookies_browser: None }
     }
 
     #[test]

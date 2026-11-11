@@ -64,6 +64,8 @@ pub struct AppConfig {
     pub window_y: Option<f32>,
     pub volume: f32,
     pub autoplay_enabled: bool,
+    #[serde(default)]
+    pub cookies_browser: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -73,6 +75,7 @@ impl Default for AppConfig {
             window_y: None,
             volume: 1.0,
             autoplay_enabled: true,
+            cookies_browser: None,
         }
     }
 }
