@@ -14,6 +14,7 @@ use std::{
 };
 
 const MAX_AUTOMATIC_FAILURES: u8 = 3;
+const MAX_HISTORY: usize = 200;
 // reqwest 0.12 blocking has no read_timeout; ClientBuilder::timeout is applied
 // per blocking operation, including every `Response::read`, so it bounds a
 // stalled range request/reconnect without capping the whole stream.
@@ -52,9 +53,14 @@ fn checked_relative_position(base: u64, offset: i64) -> io::Result<u64> {
 pub fn apply_volume(state: &mut PlayerState, volume: f32) {
     state.volume = volume.clamp(0.0, 1.5);
 }
+fn push_history(state: &mut PlayerState, track: TrackItem) {
+    state.history.push(track);
+    let excess = state.history.len().saturating_sub(MAX_HISTORY);
+    state.history.drain(..excess);
+}
 pub fn advance_queue(state: &mut PlayerState) -> Option<TrackItem> {
     if let Some(track) = state.current_track.take() {
-        state.history.push(track);
+        push_history(state, track);
     }
     let track = state.queue.pop_front()?;
     state.current_track = Some(track.clone());
@@ -681,7 +687,7 @@ impl Worker {
                 let mut tracks = tracks.into_iter();
                 if let Some(track) = tracks.next() {
                     if let Some(prev) = self.state.current_track.take() {
-                        self.state.history.push(prev);
+                        push_history(&mut self.state, prev);
                     }
                     self.state.queue.clear();
                     self.state.queue.extend(tracks);
@@ -839,6 +845,7 @@ pub fn spawn_audio_worker(
         };
         let mut media_keys = MediaKeyManager::new(media_tx);
         media_keys.sync_state(&worker.state);
+        let mut last_published_state = worker.state.clone();
         let mut running = true;
         while running {
             match cmd_rx.recv_timeout(Duration::from_millis(200)) {
@@ -890,9 +897,12 @@ pub fn spawn_audio_worker(
                     radio_mix_loaded: false,
                 });
             }
-            media_keys.sync_state(&worker.state);
-            if state_tx.send(worker.state.clone()).is_err() {
-                break;
+            if worker.state != last_published_state {
+                media_keys.sync_state(&worker.state);
+                if state_tx.send(worker.state.clone()).is_err() {
+                    break;
+                }
+                last_published_state = worker.state.clone();
             }
         }
     });
@@ -1711,6 +1721,19 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert_eq!(&bytes, b"ab");
         assert_eq!(server.finish(), vec![Some("bytes=0-".to_owned())]);
+    }
+
+    #[test]
+    fn history_is_capped_at_the_maximum() {
+        let mut state = PlayerState::default();
+        for index in 0..MAX_HISTORY + 5 {
+            push_history(&mut state, track(&format!("track-{index}")));
+        }
+        assert_eq!(state.history.len(), MAX_HISTORY);
+        assert_eq!(
+            state.history.first().map(|track| track.id.as_str()),
+            Some("track-5")
+        );
     }
 
     #[test]

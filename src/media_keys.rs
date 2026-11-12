@@ -1,6 +1,8 @@
 use std::{sync::mpsc::Sender, time::Duration};
 
-use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
+#[cfg(not(windows))]
+use souvlaki::MediaControlEvent;
+use souvlaki::{MediaControls, MediaMetadata, MediaPlayback};
 
 use crate::models::{AudioCommand, PlayerState};
 
@@ -10,36 +12,52 @@ pub struct MediaKeyManager {
 
 impl MediaKeyManager {
     pub fn new(cmd_tx: Sender<AudioCommand>) -> Self {
-        let config = PlatformConfig {
-            dbus_name: "isle",
-            display_name: "Isle",
-            hwnd: None,
-        };
-        let controls = match MediaControls::new(config) {
-            Ok(mut controls) => {
-                let attached = controls.attach(move |event| {
-                    let command = match event {
-                        MediaControlEvent::Play
-                        | MediaControlEvent::Pause
-                        | MediaControlEvent::Toggle => Some(AudioCommand::TogglePlayPause),
-                        MediaControlEvent::Next => Some(AudioCommand::NextTrack),
-                        MediaControlEvent::Previous => Some(AudioCommand::PreviousTrack),
-                        MediaControlEvent::Stop => Some(AudioCommand::Stop),
-                        _ => None,
-                    };
-                    if let Some(command) = command {
-                        let _ = cmd_tx.send(command);
+        #[cfg(windows)]
+        {
+            let _ = cmd_tx;
+            eprintln!(
+                "[isle] Media keys unavailable on Windows: souvlaki requires a HWND and eframe does not expose one"
+            );
+            return Self { controls: None };
+        }
+
+        #[cfg(not(windows))]
+        {
+            let config = souvlaki::PlatformConfig {
+                dbus_name: "isle",
+                display_name: "Isle",
+                hwnd: None,
+            };
+            let controls = match MediaControls::new(config) {
+                Ok(mut controls) => {
+                    let attached = controls.attach(move |event| {
+                        let command = match event {
+                            MediaControlEvent::Play
+                            | MediaControlEvent::Pause
+                            | MediaControlEvent::Toggle => Some(AudioCommand::TogglePlayPause),
+                            MediaControlEvent::Next => Some(AudioCommand::NextTrack),
+                            MediaControlEvent::Previous => Some(AudioCommand::PreviousTrack),
+                            MediaControlEvent::Stop => Some(AudioCommand::Stop),
+                            _ => None,
+                        };
+                        if let Some(command) = command {
+                            let _ = cmd_tx.send(command);
+                        }
+                    });
+                    if attached.is_ok() {
+                        Some(controls)
+                    } else {
+                        eprintln!("[isle] Media keys unavailable: event handler attach failed");
+                        None
                     }
-                });
-                if attached.is_ok() {
-                    Some(controls)
-                } else {
+                }
+                Err(error) => {
+                    eprintln!("[isle] Media keys unavailable: {error:?}");
                     None
                 }
-            }
-            Err(_) => None,
-        };
-        Self { controls }
+            };
+            Self { controls }
+        }
     }
 
     pub fn sync_state(&mut self, state: &PlayerState) {

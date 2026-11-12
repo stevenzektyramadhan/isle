@@ -579,6 +579,11 @@ fn run_ytdlp(flags: &[&str], target: &str) -> Result<String, ExtractorError> {
         .args(flags)
         .arg("--")
         .arg(target);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
     let output = run_command_with_timeout(command, YTDLP_TIMEOUT).map_err(|error| match error {
         ExtractorError::SubprocessIo(io_error) if io_error.kind() == ErrorKind::NotFound => {
             ExtractorError::MissingBinary

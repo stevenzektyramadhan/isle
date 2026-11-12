@@ -288,6 +288,7 @@ pub struct IsleApp {
     search_query: String,
     last_window_pos: Option<Pos2>,
     muted_volume: Option<f32>,
+    config_dirty: bool,
     last_config_save: Instant,
 }
 
@@ -307,6 +308,7 @@ impl IsleApp {
             search_query: String::new(),
             last_window_pos: None,
             muted_volume: None,
+            config_dirty: false,
             last_config_save: Instant::now(),
         }
     }
@@ -317,10 +319,21 @@ impl IsleApp {
         )));
     }
 
-    fn save_config_debounced(&mut self) {
-        if self.last_config_save.elapsed() >= Duration::from_millis(500) {
+    fn mark_config_dirty(&mut self) {
+        self.config_dirty = true;
+    }
+
+    fn flush_config(&mut self) {
+        if self.config_dirty {
             let _ = crate::config::save_config(&self.config);
+            self.config_dirty = false;
             self.last_config_save = Instant::now();
+        }
+    }
+
+    fn save_config_if_dirty(&mut self) {
+        if self.last_config_save.elapsed() >= Duration::from_millis(500) {
+            self.flush_config();
         }
     }
 
@@ -618,7 +631,7 @@ impl IsleApp {
                 let _ = self
                     .cmd_tx
                     .send(AudioCommand::SetAutoplay(self.state.autoplay_enabled));
-                let _ = crate::config::save_config(&self.config);
+                self.mark_config_dirty();
             }
             let (prev_rect, prev_resp) = ui.allocate_exact_size(vec2(28.0, 44.0), Sense::click());
             if prev_resp.hovered() {
@@ -721,7 +734,7 @@ impl IsleApp {
             }
             self.config.volume = self.state.volume;
             let _ = self.cmd_tx.send(AudioCommand::SetVolume(self.state.volume));
-            let _ = crate::config::save_config(&self.config);
+            self.mark_config_dirty();
         }
         paint_speaker(
             ui.painter(),
@@ -743,10 +756,10 @@ impl IsleApp {
                     self.muted_volume = None;
                 }
                 let _ = self.cmd_tx.send(AudioCommand::SetVolume(vol));
-                self.save_config_debounced();
+                self.mark_config_dirty();
             }
         }
-        let vol_pct = (self.state.volume / 1.5 * 100.0).round() as u32;
+        let vol_pct = (self.state.volume * 100.0).round() as u32;
         let knob_col = if v_resp.hovered() || v_resp.dragged() {
             ACCENT_LIGHT
         } else {
@@ -895,14 +908,14 @@ impl eframe::App for IsleApp {
                     self.muted_volume = None;
                 }
                 let _ = self.cmd_tx.send(AudioCommand::SetVolume(vol));
-                self.save_config_debounced();
+                self.mark_config_dirty();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                 let vol = (self.state.volume - 0.075).clamp(0.0, 1.5);
                 self.state.volume = vol;
                 self.config.volume = vol;
                 let _ = self.cmd_tx.send(AudioCommand::SetVolume(vol));
-                self.save_config_debounced();
+                self.mark_config_dirty();
             }
         }
         if let Some(pos) = ctx.input(|i| i.viewport().outer_rect.map(|r| r.min)) {
@@ -910,7 +923,7 @@ impl eframe::App for IsleApp {
                 self.last_window_pos = Some(pos);
                 self.config.window_x = Some(pos.x);
                 self.config.window_y = Some(pos.y);
-                self.save_config_debounced();
+                self.mark_config_dirty();
             }
         }
         egui::CentralPanel::default()
@@ -936,6 +949,11 @@ impl eframe::App for IsleApp {
                     }
                 });
             });
+        self.save_config_if_dirty();
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.flush_config();
     }
 }
 
