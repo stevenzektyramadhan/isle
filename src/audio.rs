@@ -6,7 +6,7 @@ use crate::{
     media_keys::MediaKeyManager,
     models::{AppConfig, AudioCommand, PlayerState, TrackItem},
 };
-use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink};
+use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use std::{
     io::{self, BufReader, Read, Seek, SeekFrom},
     sync::mpsc::{self, Receiver, Sender},
@@ -162,6 +162,41 @@ enum StartError {
     Decode,
 }
 
+type PreparedDecoder = Box<dyn Source + Send>;
+
+struct PreparedTrack {
+    decoder: PreparedDecoder,
+    detected_browser: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationOrigin {
+    Automatic { radio_mix_loaded: bool },
+    Manual,
+}
+
+struct ActivationRequest {
+    generation: u64,
+    origin: ActivationOrigin,
+    track: TrackItem,
+    client: Option<reqwest::blocking::Client>,
+    cookies_browser: Option<String>,
+}
+
+enum ActivationResult {
+    Ready {
+        generation: u64,
+        origin: ActivationOrigin,
+        decoder: PreparedDecoder,
+        detected_browser: Option<String>,
+    },
+    Failed {
+        generation: u64,
+        origin: ActivationOrigin,
+        error: StartError,
+    },
+}
+
 impl AudioBackend {
     fn new() -> Option<Self> {
         // ponytail: per-request timeout caps each HTTP Range segment; HttpRangeReader reconnects on expiry
@@ -247,24 +282,23 @@ pub fn decode_stream<R: Read + Send + Sync + 'static>(
         .ok()
 }
 
-fn start_track(
+fn prepare_track(
     track: &TrackItem,
-    backend: Option<&AudioBackend>,
-    volume: f32,
-    cookies_browser: &mut Option<String>,
-) -> Result<Sink, StartError> {
-    let backend = match backend {
-        Some(backend) => backend,
+    client: Option<&reqwest::blocking::Client>,
+    cookies_browser: Option<&str>,
+) -> Result<PreparedTrack, StartError> {
+    let client = match client {
+        Some(client) => client,
         None => {
             eprintln!("[isle] Audio output device is unavailable");
             return Err(StartError::NoAudioDevice);
         }
     };
-    let mut resolved = resolve_stream_info(&track.original_url, cookies_browser.as_deref());
+    let mut resolved = resolve_stream_info(&track.original_url, cookies_browser);
     if resolved.is_err() && !track.original_url.starts_with("ytsearch") {
         eprintln!("[isle] Stream resolution failed; trying search fallback");
         let fallback = format!("ytsearch1:{} Official Audio", track.title);
-        resolved = resolve_stream_info(&fallback, cookies_browser.as_deref());
+        resolved = resolve_stream_info(&fallback, cookies_browser);
     }
     let stream_info = match resolved {
         Ok(info) => info,
@@ -277,24 +311,23 @@ fn start_track(
         }
     };
     let mut detected_browser = stream_info.browser_used.clone();
-    let mut reader =
-        match HttpRangeReader::open(&backend.client, stream_info.url, stream_info.user_agent) {
-            Ok(reader) => Some(reader),
-            Err(err) => {
-                eprintln!(
-                    "[isle] Stream HTTP Range connection failed: {}",
-                    err.without_url()
-                );
-                None
-            }
-        };
+    let mut reader = match HttpRangeReader::open(client, stream_info.url, stream_info.user_agent) {
+        Ok(reader) => Some(reader),
+        Err(err) => {
+            eprintln!(
+                "[isle] Stream HTTP Range connection failed: {}",
+                err.without_url()
+            );
+            None
+        }
+    };
     if reader.is_none() && !track.original_url.starts_with("ytsearch") {
         eprintln!("[isle] Initial HTTP range stream failed; trying search fallback");
         let fallback = format!("ytsearch1:{} Official Audio", track.title);
-        match resolve_stream_info(&fallback, cookies_browser.as_deref()) {
+        match resolve_stream_info(&fallback, cookies_browser) {
             Ok(info) => {
                 detected_browser = info.browser_used.clone();
-                reader = match HttpRangeReader::open(&backend.client, info.url, info.user_agent) {
+                reader = match HttpRangeReader::open(client, info.url, info.user_agent) {
                     Ok(reader) => Some(reader),
                     Err(err) => {
                         eprintln!(
@@ -312,10 +345,6 @@ fn start_track(
         }
     }
     let reader = reader.ok_or(StartError::HttpConnect)?;
-    if cookies_browser.is_none() && detected_browser.is_some() {
-        eprintln!("[isle] Auto-detected usable browser cookie source");
-        *cookies_browser = detected_browser;
-    }
     let decoder = match decode_stream(BufReader::new(reader)) {
         Some(decoder) => decoder,
         None => {
@@ -323,10 +352,36 @@ fn start_track(
             return Err(StartError::Decode);
         }
     };
-    let sink = Sink::connect_new(backend.stream.mixer());
-    sink.set_volume(volume);
-    sink.append(decoder);
-    Ok(sink)
+    Ok(PreparedTrack {
+        decoder: Box::new(decoder),
+        detected_browser,
+    })
+}
+
+fn prepare_activation(request: ActivationRequest) -> ActivationResult {
+    let ActivationRequest {
+        generation,
+        origin,
+        track,
+        client,
+        cookies_browser,
+    } = request;
+    match prepare_track(&track, client.as_ref(), cookies_browser.as_deref()) {
+        Ok(PreparedTrack {
+            decoder,
+            detected_browser,
+        }) => ActivationResult::Ready {
+            generation,
+            origin,
+            decoder,
+            detected_browser,
+        },
+        Err(error) => ActivationResult::Failed {
+            generation,
+            origin,
+            error,
+        },
+    }
 }
 
 struct Worker {
@@ -336,6 +391,11 @@ struct Worker {
     state_tx: Sender<PlayerState>,
     consecutive_errors: u8,
     cookies_browser: Option<String>,
+    activation_generation: u64,
+    activation_tx: Sender<ActivationResult>,
+    activation_rx: Receiver<ActivationResult>,
+    play_when_ready: bool,
+    activation_pending: bool,
 }
 
 fn submit_error_message(error: &ExtractorError) -> &'static str {
@@ -372,7 +432,17 @@ fn start_error_message(error: &StartError) -> &'static str {
 }
 
 impl Worker {
-    fn activate(&mut self, track: TrackItem) -> bool {
+    fn invalidate_activation(&mut self) {
+        self.activation_generation = self.activation_generation.wrapping_add(1);
+        self.activation_pending = false;
+    }
+
+    fn schedule_activation(
+        &mut self,
+        track: TrackItem,
+        origin: ActivationOrigin,
+    ) -> ActivationRequest {
+        self.invalidate_activation();
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
@@ -380,31 +450,99 @@ impl Worker {
         self.state.is_playing = false;
         self.state.elapsed_secs = 0;
         self.state.status_message = Some("Loading stream…".to_owned());
+        self.play_when_ready = true;
+        self.activation_pending = true;
         let _ = self.state_tx.send(self.state.clone());
-        match start_track(
-            &track,
-            self.backend.as_ref(),
-            self.state.volume,
-            &mut self.cookies_browser,
-        ) {
-            Ok(sink) => {
+        ActivationRequest {
+            generation: self.activation_generation,
+            origin,
+            track,
+            client: self.backend.as_ref().map(|backend| backend.client.clone()),
+            cookies_browser: self.cookies_browser.clone(),
+        }
+    }
+
+    fn activate(&mut self, track: TrackItem, origin: ActivationOrigin) {
+        let request = self.schedule_activation(track, origin);
+        self.spawn_activation(request);
+    }
+
+    fn spawn_activation(&self, request: ActivationRequest) {
+        let activation_tx = self.activation_tx.clone();
+        std::thread::spawn(move || {
+            let _ = activation_tx.send(prepare_activation(request));
+        });
+    }
+
+    fn process_activation_results(&mut self) {
+        while let Ok(result) = self.activation_rx.try_recv() {
+            if let Some(request) = self.handle_activation_result(result) {
+                self.spawn_activation(request);
+            }
+        }
+    }
+
+    fn handle_activation_result(&mut self, result: ActivationResult) -> Option<ActivationRequest> {
+        match result {
+            ActivationResult::Ready {
+                generation,
+                origin,
+                decoder,
+                detected_browser,
+            } => {
+                if generation != self.activation_generation || !self.activation_pending {
+                    return None;
+                }
+                let _ = origin;
+                let backend = self.backend.as_ref()?;
+                let sink = Sink::connect_new(backend.stream.mixer());
+                sink.set_volume(self.state.volume);
+                if !self.play_when_ready {
+                    sink.pause();
+                }
+                sink.append(decoder);
+                self.activation_pending = false;
                 self.sink = Some(sink);
-                self.state.is_playing = true;
+                if self.cookies_browser.is_none() && detected_browser.is_some() {
+                    eprintln!("[isle] Auto-detected usable browser cookie source");
+                    self.cookies_browser = detected_browser;
+                }
+                self.state.is_playing = self.play_when_ready;
                 self.consecutive_errors = 0;
                 self.state.status_message = None;
-                true
+                None
             }
-            Err(error) => {
+            ActivationResult::Failed {
+                generation,
+                origin,
+                error,
+            } => {
+                if generation != self.activation_generation || !self.activation_pending {
+                    return None;
+                }
+                self.activation_pending = false;
                 self.sink = None;
                 self.state.is_playing = false;
                 self.consecutive_errors = self.consecutive_errors.saturating_add(1);
                 self.state.status_message = Some(start_error_message(&error).to_owned());
-                false
+                match origin {
+                    ActivationOrigin::Automatic { radio_mix_loaded } => {
+                        let was_paused = !self.play_when_ready;
+                        let next =
+                            self.schedule_advance(ActivationOrigin::Automatic { radio_mix_loaded });
+                        if next.is_some() && was_paused {
+                            self.play_when_ready = false;
+                        }
+                        next
+                    }
+                    ActivationOrigin::Manual => None,
+                }
             }
         }
     }
 
     fn submit(&mut self, input: &str) {
+        self.invalidate_activation();
         self.consecutive_errors = 0;
         self.state.status_message = Some(format!("Searching {input}…"));
         let _ = self.state_tx.send(self.state.clone());
@@ -417,96 +555,125 @@ impl Worker {
                     }
                     self.state.queue.clear();
                     self.state.queue.extend(tracks);
-                    self.activate(track);
+                    let request = self.schedule_activation(track, ActivationOrigin::Manual);
+                    self.spawn_activation(request);
                 }
             }
             Err(error) => self.state.status_message = Some(submit_error_message(&error).to_owned()),
         }
     }
 
-    fn advance(&mut self, automatic: bool) {
-        if !automatic {
-            self.consecutive_errors = 0;
-            if let Some(track) = advance_queue(&mut self.state) {
-                self.activate(track);
-                return;
-            }
-        }
-
-        let mut loaded_radio_mix = false;
-        loop {
-            if automatic && self.consecutive_errors >= MAX_AUTOMATIC_FAILURES {
-                self.sink = None;
-                self.state.is_playing = false;
-                self.state.elapsed_secs = 0;
-                self.state.status_message = Some("Playback stopped: repeated errors".to_owned());
-                return;
-            }
-            if let Some(track) = advance_queue(&mut self.state) {
-                if self.activate(track) || !automatic {
-                    return;
-                }
-                continue;
-            }
-            if !loaded_radio_mix && self.state.autoplay_enabled {
-                loaded_radio_mix = true;
-                if let Some(last) = self.state.history.last().cloned() {
-                    self.state.status_message = Some("Loading radio mix…".to_owned());
-                    let _ = self.state_tx.send(self.state.clone());
-                    if let Ok(related) = fetch_related_tracks(&last) {
-                        let fresh = related.into_iter().filter(|t| {
-                            !self.state.history.iter().any(|h| {
-                                h.id == t.id
-                                    || canonical_title(&h.title) == canonical_title(&t.title)
-                            })
-                        });
-                        self.state.queue.extend(fresh);
-                        if !automatic {
-                            if let Some(track) = advance_queue(&mut self.state) {
-                                self.activate(track);
-                            }
-                            return;
-                        }
-                        continue;
-                    }
-                }
-            }
-            self.sink = None;
-            self.state.is_playing = false;
-            self.state.elapsed_secs = 0;
-            return;
+    fn advance(&mut self, origin: ActivationOrigin) {
+        if let Some(request) = self.schedule_advance(origin) {
+            self.spawn_activation(request);
         }
     }
 
-    fn previous(&mut self) {
-        self.consecutive_errors = 0;
-        if let Some(track) = pop_previous(&mut self.state) {
-            self.activate(track);
+    fn schedule_advance(&mut self, origin: ActivationOrigin) -> Option<ActivationRequest> {
+        let (automatic, radio_mix_loaded) = match origin {
+            ActivationOrigin::Automatic { radio_mix_loaded } => (true, radio_mix_loaded),
+            ActivationOrigin::Manual => {
+                self.consecutive_errors = 0;
+                (false, false)
+            }
+        };
+
+        if automatic && self.consecutive_errors >= MAX_AUTOMATIC_FAILURES {
+            self.sink = None;
+            self.state.is_playing = false;
+            self.state.elapsed_secs = 0;
+            self.play_when_ready = false;
+            self.state.status_message = Some("Playback stopped: repeated errors".to_owned());
+            return None;
         }
+
+        if let Some(track) = advance_queue(&mut self.state) {
+            return Some(self.schedule_activation(track, origin));
+        }
+
+        if !radio_mix_loaded && self.state.autoplay_enabled {
+            if let Some(last) = self.state.history.last().cloned() {
+                self.state.status_message = Some("Loading radio mix…".to_owned());
+                let _ = self.state_tx.send(self.state.clone());
+                if let Ok(related) = fetch_related_tracks(&last) {
+                    let fresh = related.into_iter().filter(|track| {
+                        !self.state.history.iter().any(|history_track| {
+                            history_track.id == track.id
+                                || canonical_title(&history_track.title)
+                                    == canonical_title(&track.title)
+                        })
+                    });
+                    self.state.queue.extend(fresh);
+                    if let Some(track) = advance_queue(&mut self.state) {
+                        let origin = match origin {
+                            ActivationOrigin::Automatic { .. } => ActivationOrigin::Automatic {
+                                radio_mix_loaded: true,
+                            },
+                            ActivationOrigin::Manual => ActivationOrigin::Manual,
+                        };
+                        return Some(self.schedule_activation(track, origin));
+                    }
+                }
+            }
+        }
+
+        self.sink = None;
+        self.state.is_playing = false;
+        self.state.elapsed_secs = 0;
+        self.play_when_ready = false;
+        if matches!(origin, ActivationOrigin::Manual) {
+            self.invalidate_activation();
+        }
+        None
+    }
+
+    fn previous(&mut self) {
+        if let Some(request) = self.schedule_previous() {
+            self.spawn_activation(request);
+        }
+    }
+
+    fn schedule_previous(&mut self) -> Option<ActivationRequest> {
+        self.consecutive_errors = 0;
+        self.invalidate_activation();
+        pop_previous(&mut self.state)
+            .map(|track| self.schedule_activation(track, ActivationOrigin::Manual))
     }
 
     fn toggle(&mut self) {
         if let Some(sink) = self.sink.as_ref() {
-            if self.state.is_playing {
-                sink.pause();
-            } else {
+            self.play_when_ready = !self.state.is_playing;
+            if self.play_when_ready {
                 sink.play();
+            } else {
+                sink.pause();
             }
-            self.state.is_playing = !self.state.is_playing;
+            self.state.is_playing = self.play_when_ready;
+        } else if self.activation_pending {
+            self.play_when_ready = !self.play_when_ready;
         } else if let Some(track) = self.state.current_track.clone() {
-            self.activate(track);
+            self.activate(track, ActivationOrigin::Manual);
         } else {
-            self.advance(false);
+            self.advance(ActivationOrigin::Manual);
+        }
+    }
+
+    fn set_volume(&mut self, volume: f32) {
+        apply_volume(&mut self.state, volume);
+        if let Some(sink) = self.sink.as_ref() {
+            sink.set_volume(self.state.volume);
         }
     }
 
     fn stop(&mut self) {
+        self.invalidate_activation();
         if let Some(sink) = self.sink.take() {
             sink.stop();
         }
         self.state.current_track = None;
         self.state.is_playing = false;
         self.state.elapsed_secs = 0;
+        self.play_when_ready = false;
     }
 }
 
@@ -525,6 +692,7 @@ pub fn spawn_audio_worker(
             return;
         }
         let cookies_browser = initial_config.cookies_browser.clone();
+        let (activation_tx, activation_rx) = mpsc::channel();
         let mut worker = Worker {
             state,
             sink: None,
@@ -532,6 +700,11 @@ pub fn spawn_audio_worker(
             state_tx: state_tx.clone(),
             consecutive_errors: 0,
             cookies_browser,
+            activation_generation: 0,
+            activation_tx,
+            activation_rx,
+            play_when_ready: false,
+            activation_pending: false,
         };
         let mut media_keys = MediaKeyManager::new(media_tx);
         media_keys.sync_state(&worker.state);
@@ -540,18 +713,13 @@ pub fn spawn_audio_worker(
             match cmd_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(AudioCommand::SubmitInput(input)) => worker.submit(&input),
                 Ok(AudioCommand::PlayTrack(track)) => {
-                    worker.activate(track);
+                    worker.activate(track, ActivationOrigin::Manual);
                 }
                 Ok(AudioCommand::TogglePlayPause) => worker.toggle(),
                 Ok(AudioCommand::Stop) => worker.stop(),
-                Ok(AudioCommand::NextTrack) => worker.advance(false),
+                Ok(AudioCommand::NextTrack) => worker.advance(ActivationOrigin::Manual),
                 Ok(AudioCommand::PreviousTrack) => worker.previous(),
-                Ok(AudioCommand::SetVolume(volume)) => {
-                    apply_volume(&mut worker.state, volume);
-                    if let Some(sink) = worker.sink.as_ref() {
-                        sink.set_volume(worker.state.volume);
-                    }
-                }
+                Ok(AudioCommand::SetVolume(volume)) => worker.set_volume(volume),
                 Ok(AudioCommand::SetAutoplay(enabled)) => worker.state.autoplay_enabled = enabled,
                 Ok(AudioCommand::Seek(pos)) => {
                     if let Some(sink) = worker.sink.as_ref() {
@@ -570,6 +738,7 @@ pub fn spawn_audio_worker(
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
+            worker.process_activation_results();
             if worker.state.is_playing {
                 if let Some(sink) = worker.sink.as_ref() {
                     worker.state.elapsed_secs = sink.get_pos().as_secs();
@@ -578,7 +747,9 @@ pub fn spawn_audio_worker(
             let completed =
                 worker.state.is_playing && worker.sink.as_ref().is_some_and(Sink::empty);
             if completed {
-                worker.advance(true);
+                worker.advance(ActivationOrigin::Automatic {
+                    radio_mix_loaded: false,
+                });
             }
             media_keys.sync_state(&worker.state);
             if state_tx.send(worker.state.clone()).is_err() {
@@ -606,6 +777,7 @@ mod tests {
 
     fn worker_with_tracks(consecutive_errors: u8, track_ids: &[&str]) -> Worker {
         let (state_tx, _state_rx) = mpsc::channel();
+        let (activation_tx, activation_rx) = mpsc::channel();
         let mut state = PlayerState::default();
         state
             .queue
@@ -617,11 +789,33 @@ mod tests {
             state_tx,
             consecutive_errors,
             cookies_browser: None,
+            activation_generation: 0,
+            activation_tx,
+            activation_rx,
+            play_when_ready: false,
+            activation_pending: false,
         }
     }
 
     fn worker_with_queue(consecutive_errors: u8) -> Worker {
         worker_with_tracks(consecutive_errors, &["next"])
+    }
+
+    fn failed_activation(generation: u64, origin: ActivationOrigin) -> ActivationResult {
+        ActivationResult::Failed {
+            generation,
+            origin,
+            error: StartError::NoAudioDevice,
+        }
+    }
+
+    fn ready_activation(generation: u64, browser: Option<&str>) -> ActivationResult {
+        ActivationResult::Ready {
+            generation,
+            origin: ActivationOrigin::Manual,
+            decoder: Box::new(rodio::source::Zero::new(1, 44_100)),
+            detected_browser: browser.map(str::to_owned),
+        }
     }
 
     #[test]
@@ -655,7 +849,11 @@ mod tests {
     #[test]
     fn repeated_error_guard_blocks_only_automatic_advance() {
         let mut worker = worker_with_queue(3);
-        worker.advance(true);
+        assert!(worker
+            .schedule_advance(ActivationOrigin::Automatic {
+                radio_mix_loaded: false,
+            })
+            .is_none());
         assert_eq!(worker.state.queue.len(), 1);
         assert_eq!(worker.state.current_track, None);
         assert_eq!(
@@ -665,22 +863,27 @@ mod tests {
     }
 
     #[test]
-    fn start_track_without_backend_returns_no_audio_device() {
-        let mut cookies_browser = None;
-
+    fn prepare_track_without_client_returns_no_audio_device() {
         assert!(matches!(
-            start_track(&track("current"), None, 1.0, &mut cookies_browser),
+            prepare_track(&track("current"), None, None),
             Err(StartError::NoAudioDevice)
         ));
-        assert_eq!(cookies_browser, None);
     }
 
     #[test]
-    fn backend_none_reports_no_audio_device_status() {
+    fn accepted_manual_failure_reports_no_audio_device_status() {
         let mut worker = worker_with_queue(0);
-        worker.activate(track("current"));
+        let request = worker.schedule_activation(track("current"), ActivationOrigin::Manual);
+
+        assert!(worker
+            .handle_activation_result(failed_activation(
+                request.generation,
+                ActivationOrigin::Manual,
+            ))
+            .is_none());
 
         assert!(!worker.state.is_playing);
+        assert_eq!(worker.consecutive_errors, 1);
         assert_eq!(
             worker.state.status_message.as_deref(),
             Some("No audio device")
@@ -718,7 +921,35 @@ mod tests {
     #[test]
     fn automatic_advance_skips_three_failures_and_leaves_the_fourth_queued() {
         let mut worker = worker_with_tracks(0, &["one", "two", "three", "four"]);
-        worker.advance(true);
+        let first = worker
+            .schedule_advance(ActivationOrigin::Automatic {
+                radio_mix_loaded: false,
+            })
+            .unwrap();
+        let second = worker
+            .handle_activation_result(failed_activation(
+                first.generation,
+                ActivationOrigin::Automatic {
+                    radio_mix_loaded: false,
+                },
+            ))
+            .unwrap();
+        let third = worker
+            .handle_activation_result(failed_activation(
+                second.generation,
+                ActivationOrigin::Automatic {
+                    radio_mix_loaded: false,
+                },
+            ))
+            .unwrap();
+        assert!(worker
+            .handle_activation_result(failed_activation(
+                third.generation,
+                ActivationOrigin::Automatic {
+                    radio_mix_loaded: false,
+                },
+            ))
+            .is_none());
 
         assert_eq!(worker.consecutive_errors, 3);
         assert_eq!(
@@ -744,8 +975,9 @@ mod tests {
     #[test]
     fn manual_next_resets_the_error_guard_and_advances() {
         let mut worker = worker_with_queue(3);
-        worker.advance(false);
-        assert_eq!(worker.consecutive_errors, 1);
+        let request = worker.schedule_advance(ActivationOrigin::Manual).unwrap();
+        assert_eq!(request.origin, ActivationOrigin::Manual);
+        assert_eq!(worker.consecutive_errors, 0);
         assert!(worker.state.queue.is_empty());
         assert_eq!(
             worker
@@ -757,7 +989,7 @@ mod tests {
         );
         assert_eq!(
             worker.state.status_message.as_deref(),
-            Some("No audio device")
+            Some("Loading stream…")
         );
     }
 
@@ -766,8 +998,9 @@ mod tests {
         let mut worker = worker_with_queue(3);
         worker.state.current_track = Some(track("current"));
         worker.state.history.push(track("previous"));
-        worker.previous();
-        assert_eq!(worker.consecutive_errors, 1);
+        let request = worker.schedule_previous().unwrap();
+        assert_eq!(request.origin, ActivationOrigin::Manual);
+        assert_eq!(worker.consecutive_errors, 0);
         assert_eq!(
             worker
                 .state
@@ -778,8 +1011,132 @@ mod tests {
         );
         assert_eq!(
             worker.state.status_message.as_deref(),
-            Some("No audio device")
+            Some("Loading stream…")
         );
+    }
+
+    #[test]
+    fn stale_failed_activation_does_not_advance_or_change_state() {
+        let mut worker = worker_with_tracks(1, &["queued"]);
+        let stale = worker.schedule_activation(
+            track("stale"),
+            ActivationOrigin::Automatic {
+                radio_mix_loaded: false,
+            },
+        );
+        let current = worker.schedule_activation(track("current"), ActivationOrigin::Manual);
+
+        assert!(worker
+            .handle_activation_result(failed_activation(
+                stale.generation,
+                ActivationOrigin::Automatic {
+                    radio_mix_loaded: false,
+                },
+            ))
+            .is_none());
+
+        assert_eq!(worker.activation_generation, current.generation);
+        assert_eq!(worker.consecutive_errors, 1);
+        assert_eq!(
+            worker
+                .state
+                .current_track
+                .as_ref()
+                .map(|track| track.id.as_str()),
+            Some("current")
+        );
+        assert_eq!(
+            worker.state.queue.front().map(|track| track.id.as_str()),
+            Some("queued")
+        );
+        assert_eq!(
+            worker.state.status_message.as_deref(),
+            Some("Loading stream…")
+        );
+        assert!(worker.activation_pending);
+    }
+
+    #[test]
+    fn stale_ready_activation_does_not_install_or_cache_browser() {
+        let mut worker = worker_with_queue(2);
+        let stale = worker.schedule_activation(track("stale"), ActivationOrigin::Manual);
+        let current = worker.schedule_activation(track("current"), ActivationOrigin::Manual);
+
+        assert!(worker
+            .handle_activation_result(ready_activation(stale.generation, Some("firefox")))
+            .is_none());
+
+        assert_eq!(worker.activation_generation, current.generation);
+        assert_eq!(worker.cookies_browser, None);
+        assert_eq!(worker.consecutive_errors, 2);
+        assert!(worker.sink.is_none());
+        assert_eq!(
+            worker
+                .state
+                .current_track
+                .as_ref()
+                .map(|track| track.id.as_str()),
+            Some("current")
+        );
+        assert_eq!(
+            worker.state.status_message.as_deref(),
+            Some("Loading stream…")
+        );
+        assert!(worker.activation_pending);
+    }
+
+    #[test]
+    fn toggle_while_loading_changes_playback_intent_without_new_generation() {
+        let mut worker = worker_with_queue(0);
+        let request = worker.schedule_activation(track("current"), ActivationOrigin::Manual);
+
+        worker.toggle();
+
+        assert_eq!(worker.activation_generation, request.generation);
+        assert!(worker.activation_pending);
+        assert!(!worker.play_when_ready);
+        assert!(!worker.state.is_playing);
+    }
+
+    #[test]
+    fn volume_change_while_loading_keeps_the_activation_current() {
+        let mut worker = worker_with_queue(0);
+        let request = worker.schedule_activation(track("current"), ActivationOrigin::Manual);
+
+        worker.set_volume(1.25);
+
+        assert_eq!(worker.activation_generation, request.generation);
+        assert!(worker.activation_pending);
+        assert!((worker.state.volume - 1.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn automatic_failure_preserves_paused_loading_intent() {
+        let mut worker = worker_with_tracks(0, &["one", "two"]);
+        let first = worker
+            .schedule_advance(ActivationOrigin::Automatic {
+                radio_mix_loaded: false,
+            })
+            .unwrap();
+        worker.toggle();
+
+        let second = worker
+            .handle_activation_result(failed_activation(
+                first.generation,
+                ActivationOrigin::Automatic {
+                    radio_mix_loaded: false,
+                },
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            second.origin,
+            ActivationOrigin::Automatic {
+                radio_mix_loaded: false
+            }
+        ));
+        assert!(worker.activation_pending);
+        assert!(!worker.play_when_ready);
     }
 
     #[test]
