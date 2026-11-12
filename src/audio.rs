@@ -14,6 +14,15 @@ use std::{
 };
 
 const MAX_AUTOMATIC_FAILURES: u8 = 3;
+// reqwest 0.12 blocking has no read_timeout; ClientBuilder::timeout is applied
+// per blocking operation, including every `Response::read`, so it bounds a
+// stalled range request/reconnect without capping the whole stream.
+const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn clamped_seek_position(position: Duration, duration_secs: Option<u64>) -> Duration {
+    duration_secs.map_or(position, |secs| position.min(Duration::from_secs(secs)))
+}
 
 fn seek_error() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "invalid stream seek")
@@ -112,16 +121,22 @@ enum ActivationResult {
     },
 }
 
+fn build_http_client(
+    connect_timeout: Duration,
+    io_timeout: Duration,
+) -> Option<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0")
+        .connect_timeout(connect_timeout)
+        .tcp_keepalive(Duration::from_secs(15))
+        .timeout(io_timeout)
+        .build()
+        .ok()
+}
+
 impl AudioBackend {
     fn new() -> Option<Self> {
-        // ponytail: per-request timeout caps each HTTP Range segment; HttpRangeReader reconnects on expiry
-        let client = reqwest::blocking::Client::builder()
-            .user_agent("Mozilla/5.0")
-            .connect_timeout(Duration::from_secs(10))
-            .tcp_keepalive(Duration::from_secs(15))
-            .timeout(Duration::from_secs(300))
-            .build()
-            .ok()?;
+        let client = build_http_client(STREAM_CONNECT_TIMEOUT, STREAM_IO_TIMEOUT)?;
         Some(Self {
             stream: OutputStreamBuilder::open_default_stream().ok()?,
             client,
@@ -788,6 +803,7 @@ impl Worker {
         self.state.current_track = None;
         self.state.is_playing = false;
         self.state.elapsed_secs = 0;
+        self.state.status_message = None;
         self.play_when_ready = false;
     }
 }
@@ -837,6 +853,14 @@ pub fn spawn_audio_worker(
                 Ok(AudioCommand::SetVolume(volume)) => worker.set_volume(volume),
                 Ok(AudioCommand::SetAutoplay(enabled)) => worker.state.autoplay_enabled = enabled,
                 Ok(AudioCommand::Seek(pos)) => {
+                    let pos = clamped_seek_position(
+                        pos,
+                        worker
+                            .state
+                            .current_track
+                            .as_ref()
+                            .and_then(|track| track.duration_secs),
+                    );
                     if let Some(sink) = worker.sink.as_ref() {
                         if sink.try_seek(pos).is_ok() {
                             worker.state.elapsed_secs = pos.as_secs();
@@ -976,6 +1000,20 @@ mod tests {
             .unwrap()
     }
 
+    fn stalled_server() -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let _ = read_range_header(&mut stream);
+            thread::sleep(Duration::from_millis(600));
+        });
+        (url, handle)
+    }
+
     fn track(track_id: &str) -> TrackItem {
         TrackItem {
             id: track_id.to_owned(),
@@ -1027,6 +1065,65 @@ mod tests {
             decoder: Box::new(rodio::source::Zero::new(1, 44_100)),
             detected_browser: browser.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn stream_io_timeouts_are_short() {
+        assert!(STREAM_CONNECT_TIMEOUT <= Duration::from_secs(10));
+        assert!(STREAM_IO_TIMEOUT <= Duration::from_secs(10));
+    }
+
+    #[test]
+    fn blocking_timeout_aborts_a_stalled_range_request() {
+        let (url, _server) = stalled_server();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let result = client
+            .get(url)
+            .header(reqwest::header::RANGE, "bytes=0-")
+            .send();
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err());
+        assert!(elapsed >= Duration::from_millis(80));
+        assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stop_clears_the_loading_status_message() {
+        let mut worker = worker_with_queue(0);
+        worker.state.status_message = Some("Loading stream…".to_owned());
+
+        worker.stop();
+
+        assert_eq!(worker.state.status_message, None);
+        assert_eq!(worker.state.current_track, None);
+        assert!(!worker.state.is_playing);
+    }
+
+    #[test]
+    fn clamped_seek_position_stays_within_known_duration() {
+        assert_eq!(
+            clamped_seek_position(Duration::from_secs(200), Some(180)),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            clamped_seek_position(Duration::from_secs(90), Some(180)),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            clamped_seek_position(Duration::from_secs(200), None),
+            Duration::from_secs(200)
+        );
+        assert_eq!(
+            clamped_seek_position(Duration::from_secs(200), Some(0)),
+            Duration::ZERO
+        );
     }
 
     #[test]
