@@ -14,7 +14,16 @@ fn main() -> eframe::Result<()> {
         .with_always_on_top()
         .with_inner_size([ui::PILL_WIDTH, ui::PILL_HEIGHT])
         .with_resizable(false);
-    if let (Some(x), Some(y)) = (config.window_x, config.window_y) { viewport = viewport.with_position([x, y]); }
-    let native_options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native("Isle", native_options, Box::new(move |cc| Ok(Box::new(ui::IsleApp::new(cc, cmd_tx, state_rx, config)))))
+    if let (Some(x), Some(y)) = (config.window_x, config.window_y) {
+        viewport = viewport.with_position([x, y]);
+    }
+    let native_options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "Isle",
+        native_options,
+        Box::new(move |cc| Ok(Box::new(ui::IsleApp::new(cc, cmd_tx, state_rx, config)))),
+    )
 }

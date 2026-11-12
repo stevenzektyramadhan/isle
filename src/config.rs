@@ -1,4 +1,3 @@
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,15 +12,10 @@ pub enum ConfigError {
 }
 
 pub fn config_file_path() -> PathBuf {
-    let config_home = match env::var_os("XDG_CONFIG_HOME") {
-        Some(path) if !path.is_empty() => PathBuf::from(path),
-        _ => match env::var_os("HOME") {
-            Some(home) if !home.is_empty() => PathBuf::from(home).join(".config"),
-            _ => PathBuf::from(".config"),
-        },
-    };
-
-    config_home.join("isle").join("config.json")
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("isle")
+        .join("config.json")
 }
 
 pub fn load_config() -> AppConfig {
@@ -47,7 +41,10 @@ pub fn save_config(config: &AppConfig) -> Result<(), ConfigError> {
 }
 
 pub fn save_config_to(path: &Path, config: &AppConfig) -> Result<(), ConfigError> {
-    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         fs::create_dir_all(parent)?;
     }
 
@@ -149,6 +146,13 @@ mod tests {
         assert_eq!(config.window_y, None);
         assert_eq!(config.volume, 0.5);
         fs::remove_dir_all(&directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn config_file_path_is_namespaced_under_the_platform_config_directory() {
+        let path = config_file_path();
+        assert_eq!(path.file_name().unwrap(), "config.json");
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), "isle");
     }
 
     #[test]
