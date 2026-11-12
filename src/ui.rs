@@ -555,7 +555,6 @@ impl IsleApp {
                 if let Some(pos) = bar_resp.interact_pointer_pos() {
                     let seek_ratio = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
                     let seek_secs = (seek_ratio * duration as f32) as u64;
-                    self.state.elapsed_secs = seek_secs;
                     let _ = self
                         .cmd_tx
                         .send(AudioCommand::Seek(Duration::from_secs(seek_secs)));
@@ -872,7 +871,6 @@ impl eframe::App for IsleApp {
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
                 let new_secs = self.state.elapsed_secs.saturating_sub(5);
-                self.state.elapsed_secs = new_secs;
                 let _ = self
                     .cmd_tx
                     .send(AudioCommand::Seek(Duration::from_secs(new_secs)));
@@ -885,7 +883,6 @@ impl eframe::App for IsleApp {
                     .and_then(|t| t.duration_secs)
                     .unwrap_or(u64::MAX);
                 let new_secs = (self.state.elapsed_secs + 5).min(duration);
-                self.state.elapsed_secs = new_secs;
                 let _ = self
                     .cmd_tx
                     .send(AudioCommand::Seek(Duration::from_secs(new_secs)));
