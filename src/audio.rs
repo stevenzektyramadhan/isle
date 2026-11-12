@@ -898,7 +898,9 @@ pub fn spawn_audio_worker(
                 });
             }
             if worker.state != last_published_state {
-                media_keys.sync_state(&worker.state);
+                if media_state_changed(&last_published_state, &worker.state) {
+                    media_keys.sync_state(&worker.state);
+                }
                 if state_tx.send(worker.state.clone()).is_err() {
                     break;
                 }
@@ -907,6 +909,10 @@ pub fn spawn_audio_worker(
         }
     });
     (cmd_tx, state_rx)
+}
+
+fn media_state_changed(previous: &PlayerState, current: &PlayerState) -> bool {
+    previous.current_track != current.current_track || previous.is_playing != current.is_playing
 }
 
 #[cfg(test)]
@@ -1114,6 +1120,25 @@ mod tests {
         assert_eq!(worker.state.status_message, None);
         assert_eq!(worker.state.current_track, None);
         assert!(!worker.state.is_playing);
+    }
+
+    #[test]
+    fn media_state_sync_ignores_elapsed_time_but_detects_stop() {
+        let mut playing = PlayerState {
+            current_track: Some(track("playing")),
+            is_playing: true,
+            ..PlayerState::default()
+        };
+        let previous = playing.clone();
+
+        playing.elapsed_secs = 1;
+        assert!(!media_state_changed(&previous, &playing));
+
+        let mut stopped = playing.clone();
+        stopped.current_track = None;
+        stopped.is_playing = false;
+        stopped.elapsed_secs = 0;
+        assert!(media_state_changed(&playing, &stopped));
     }
 
     #[test]
