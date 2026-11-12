@@ -964,6 +964,9 @@ mod tests {
                         Err(error) => panic!("test server accept failed: {error}"),
                     }
                 };
+                // Windows and macOS inherit the listener's non-blocking mode on
+                // accepted sockets, unlike Linux, so restore blocking reads.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
