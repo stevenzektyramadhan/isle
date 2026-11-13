@@ -1,6 +1,7 @@
 use std::{
     io::{ErrorKind, Read},
     net::{Ipv4Addr, Ipv6Addr},
+    path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
@@ -128,9 +129,30 @@ pub fn classify_input(raw: &str) -> Result<InputKind, ExtractorError> {
 
 pub fn is_ytdlp_available() -> bool {
     matches!(
-        Command::new("yt-dlp").arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status(),
+        Command::new(ytdlp_program())
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
         Ok(status) if status.success()
     )
+}
+
+fn ytdlp_program() -> PathBuf {
+    ytdlp_program_for(std::env::current_exe().ok().as_deref(), cfg!(windows))
+}
+
+fn ytdlp_program_for(executable_path: Option<&Path>, use_adjacent_windows_binary: bool) -> PathBuf {
+    if use_adjacent_windows_binary {
+        if let Some(program) = executable_path
+            .and_then(Path::parent)
+            .map(|directory| directory.join("yt-dlp.exe"))
+            .filter(|program| program.is_file())
+        {
+            return program;
+        }
+    }
+    PathBuf::from("yt-dlp")
 }
 
 pub fn resolve_input(raw: &str) -> Result<Vec<TrackItem>, ExtractorError> {
@@ -573,7 +595,7 @@ fn run_command_with_timeout(
 /// Run yt-dlp with hardened defaults. `target` is the positional arg (URL/query)
 /// inserted after a `--` delimiter to prevent flag injection.
 fn run_ytdlp(flags: &[&str], target: &str) -> Result<String, ExtractorError> {
-    let mut command = Command::new("yt-dlp");
+    let mut command = Command::new(ytdlp_program());
     command
         .args(YTDLP_BASE_ARGS)
         .args(flags)
@@ -668,6 +690,48 @@ pub fn parse_spotify_oembed_title(json_str: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "isle-extractor-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after Unix epoch")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn windows_ytdlp_selector_prefers_an_adjacent_existing_binary() {
+        let directory = unique_temp_dir("bundled-ytdlp");
+        std::fs::create_dir_all(&directory).expect("test directory should be created");
+        let bundled = directory.join("yt-dlp.exe");
+        std::fs::write(&bundled, []).expect("bundled binary fixture should be created");
+
+        assert_eq!(
+            ytdlp_program_for(Some(&directory.join("isle.exe")), true),
+            bundled
+        );
+
+        std::fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn ytdlp_selector_falls_back_to_path_without_an_adjacent_windows_binary() {
+        let directory = unique_temp_dir("missing-ytdlp");
+        let executable = directory.join("isle.exe");
+
+        assert_eq!(
+            ytdlp_program_for(Some(&executable), true),
+            PathBuf::from("yt-dlp")
+        );
+        assert_eq!(ytdlp_program_for(None, true), PathBuf::from("yt-dlp"));
+        assert_eq!(
+            ytdlp_program_for(Some(&executable), false),
+            PathBuf::from("yt-dlp")
+        );
+    }
 
     #[test]
     fn classifies_trimmed_input_and_every_kind() {
