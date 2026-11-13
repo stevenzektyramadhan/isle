@@ -1,6 +1,8 @@
 # Isle 🏝️
 
-**Isle** adalah mini desktop audio player ultra-ringan berbentuk *floating pill / island* (mirip Dynamic Island) yang dibuat menggunakan **Rust**, **egui / eframe**, dan **rodio**.
+[![CI](https://github.com/stevenzektyramadhan/isle/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/stevenzektyramadhan/isle/actions/workflows/ci.yml)
+
+**Isle** adalah mini desktop audio player berbentuk *floating pill / island* (mirip Dynamic Island) yang dibuat menggunakan **Rust**, **egui / eframe**, dan **rodio**.
 
 Aplikasi ini dirancang untuk mendengarkan lagu secara langsung tanpa browser, tanpa WebView, dan tanpa cache audio di disk. Cukup tempel link YouTube atau Spotify (Track, Album, Playlist), atau ketik judul lagu, lalu dengarkan musik di latar belakang.
 
@@ -21,28 +23,39 @@ Aplikasi ini dirancang untuk mendengarkan lagu secara langsung tanpa browser, ta
 - **Pintasan Keyboard**: Play/pause, seek, volume, dan perpindahan mode dari keyboard.
 - **Quick Mute & Volume Control**: Slider volume dengan tooltip persentase (`volume * 100`, maksimum 150%) serta klik ikon speaker untuk mute/unmute.
 - **Queue Peek Tooltip**: Hover tombol antrean untuk melihat preview 5 lagu berikutnya.
-- **Media Keys / MPRIS**: Tombol play/pause, next, dan previous via `souvlaki` di Linux. Di Windows, media keys dinonaktifkan dengan peringatan saat startup karena eframe tidak mengekspos HWND yang dibutuhkan souvlaki.
+- **Media Keys / MPRIS**: Tombol play/pause, next, dan previous via `souvlaki` di Linux melalui MPRIS. Di Windows, kontrol media kini memakai HWND dari `eframe` dan `souvlaki`, tetapi tetap memerlukan validasi runtime manual di Windows.
 - **Posisi Window Persistent**: Posisi window disimpan di config platform (lihat bagian config).
 
 ---
 
 ## 🛠️ Prasyarat Sistem
 
-1. **Rust & Cargo** (minimum `1.77`, sesuai `rust-version` di `Cargo.toml`):
+1. **Rust & Cargo** (minimum `1.88`, sesuai `rust-version` di `Cargo.toml`):
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    ```
-2. **`yt-dlp`** (wajib ada di `PATH`):
+2. **`yt-dlp`** (wajib tersedia di `PATH`):
    Isle memakai `yt-dlp` untuk resolusi stream audio. Versi yang diuji: **2026.10.26**. Versi lebih lama tidak dijamin.
    ```bash
-   # Arch Linux / Manjaro:
+   # Linux, paket distro Arch / Manjaro:
    sudo pacman -S yt-dlp
 
-   # Ubuntu / Debian:
+   # Linux, paket distro Ubuntu / Debian:
    sudo apt update && sudo apt install yt-dlp
 
-   # Atau via pip / pipx:
+   # Linux, Windows, atau macOS via pip:
    pip install -U yt-dlp
+   ```
+   ```powershell
+   # Windows via winget:
+   winget install yt-dlp.yt-dlp
+
+   # Windows via Scoop:
+   scoop install yt-dlp
+   ```
+   ```bash
+   # macOS via Homebrew:
+   brew install yt-dlp
    ```
 3. **Dependensi GUI & Audio Linux**:
    - ALSA / PulseAudio
@@ -58,7 +71,7 @@ git clone https://github.com/stevenzektyramadhan/isle.git
 cd isle
 ```
 
-### 2. Jalankan Mode Development
+### 2. Jalankan Mode Development (Linux, Windows, atau macOS)
 ```bash
 cargo run
 ```
@@ -67,11 +80,21 @@ cargo run
 ```bash
 cargo build --release
 ```
-Binary berada di `target/release/isle`:
+Binary berada di `target/release/isle` pada Linux dan macOS, atau `target\release\isle.exe` pada Windows.
 ```bash
-cp target/release/isle ~/.local/bin/
-isle
+# Linux / macOS:
+./target/release/isle
 ```
+```powershell
+# Windows:
+.\target\release\isle.exe
+```
+
+### 4. Verifikasi CI dan Batas Validasi Runtime
+
+CI mengunci build dan test pada Ubuntu, Windows, dan macOS. Pada Linux, CI juga menjalankan `cargo fmt --check` dan `cargo clippy --all-targets -- -D warnings`; pemeriksaan Rust `1.88` juga dijalankan. CI tidak memvalidasi perilaku GUI, audio, atau perangkat keras media secara nyata.
+
+Kontrol media Windows kini menggunakan HWND-backed integration melalui `eframe`/`souvlaki`, tetapi validasi runtime native Windows belum dilakukan. Dukungan Linux menggunakan MPRIS. Belum ada klaim dukungan media key macOS.
 
 ---
 
@@ -163,7 +186,7 @@ Diukur pada Linux (PipeWire/ALSA, shared library NVIDIA + Mesa), sampel `VmRSS` 
 | Lagu pendek (212 dtk, 45 dtk playback) | 30 × 1 dtk | 141.684 KB (138,4 MiB) | 142.038 KB (138,7 MiB) | 142.156 KB (138,8 MiB) |
 | Stream panjang (MP3 ~6 menit, 5 menit playback) | 150 × 2 dtk | 140.712 KB (137,4 MiB) | 141.167 KB (137,9 MiB) | 141.460 KB (138,1 MiB) |
 
-RSS puncak sekitar **139 MiB** dan didominasi shared library GPU/LLVM (`libLLVM` ~25,8 MB, `libnvidia-gpucomp` ~19,8 MB, `gallium` ~12,2 MB). Private dirty sekitar 29–30 MB; playback hanya menambah sekitar **4–5 MB** dibanding idle. PSS idle ~76 MiB dan ~109 MiB saat stream panjang. Angka RSS sangat bergantung pada driver/GPU dan bukan ukuran heap aplikasi.
+RSS puncak pada pengukuran Linux sekitar **139 MiB** dan didominasi shared library GPU/LLVM (`libLLVM` ~25,8 MB, `libnvidia-gpucomp` ~19,8 MB, `gallium` ~12,2 MB). Private dirty sekitar 29–30 MB; playback hanya menambah sekitar **4–5 MB** dibanding idle. PSS idle ~76 MiB dan ~109 MiB saat stream panjang. Angka RSS sangat bergantung pada driver/GPU dan bukan ukuran heap aplikasi. Pengukuran ini hanya mencakup Linux, bukan klaim performa lintas platform.
 
 ---
 
