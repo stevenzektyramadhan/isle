@@ -65,6 +65,12 @@ Aplikasi ini dirancang untuk mendengarkan lagu secara langsung tanpa browser, ta
 
 ## 🚀 Cara Instalasi & Menjalankan
 
+### Bundle Portabel Windows
+
+Bundle portabel berisi `isle.exe`, `yt-dlp.exe`, dan `README.txt` dalam satu folder. Extract ZIP, jangan pisahkan kedua file `.exe`, lalu double-click `isle.exe`. Bundle ini tidak memerlukan Rust, Cargo, Visual Studio, hak administrator, atau pengaturan `PATH`; `yt-dlp.exe` sudah disertakan. Koneksi internet tetap diperlukan. Config Windows disimpan di `%APPDATA%\isle\config.json`.
+
+Instruksi ini berlaku untuk bundle portabel. Build dari source tetap memerlukan `yt-dlp` yang tersedia di `PATH`, seperti dijelaskan di bagian prasyarat.
+
 ### 1. Clone Repository
 ```bash
 git clone https://github.com/stevenzektyramadhan/isle.git
