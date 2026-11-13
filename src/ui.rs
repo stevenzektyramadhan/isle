@@ -2,7 +2,11 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, pos2, vec2, Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
+#[cfg(windows)]
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
+#[cfg(windows)]
+use crate::media_keys::MediaKeyManager;
 use crate::models::{AppConfig, AudioCommand, PlayerState};
 
 pub const PILL_WIDTH: f32 = 290.0;
@@ -290,15 +294,33 @@ pub struct IsleApp {
     muted_volume: Option<f32>,
     config_dirty: bool,
     last_config_save: Instant,
+    #[cfg(windows)]
+    media_keys: MediaKeyManager,
 }
 
 impl IsleApp {
     pub fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         cmd_tx: Sender<AudioCommand>,
         state_rx: Receiver<PlayerState>,
         config: AppConfig,
     ) -> Self {
+        #[cfg(not(windows))]
+        let _ = cc;
+        #[cfg(windows)]
+        let mut media_keys = MediaKeyManager::new(
+            cmd_tx.clone(),
+            cc.window_handle()
+                .ok()
+                .and_then(|handle| match handle.as_raw() {
+                    RawWindowHandle::Win32(handle) => {
+                        Some(handle.hwnd.get() as *mut std::ffi::c_void)
+                    }
+                    _ => None,
+                }),
+        );
+        #[cfg(windows)]
+        media_keys.sync_state(&PlayerState::default());
         Self {
             cmd_tx,
             state_rx,
@@ -310,6 +332,8 @@ impl IsleApp {
             muted_volume: None,
             config_dirty: false,
             last_config_save: Instant::now(),
+            #[cfg(windows)]
+            media_keys,
         }
     }
 
@@ -860,8 +884,18 @@ impl eframe::App for IsleApp {
         [0.0, 0.0, 0.0, 0.0]
     }
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        let mut media_state_changed = false;
         while let Ok(next_state) = self.state_rx.try_recv() {
+            #[cfg(windows)]
+            {
+                media_state_changed |= crate::audio::media_state_changed(&self.state, &next_state);
+            }
             self.state = next_state;
+        }
+        #[cfg(windows)]
+        if media_state_changed {
+            self.media_keys.sync_state(&self.state);
         }
         ctx.request_repaint_after(Duration::from_millis(250));
         let (escape, toggle) = ctx.input(|i| {
