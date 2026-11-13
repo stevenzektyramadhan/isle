@@ -299,6 +299,20 @@ fn configure_windows_window(hwnd: *mut std::ffi::c_void) {
     if hwnd.is_null() {
         return;
     }
+
+    #[repr(C)]
+    struct Margins {
+        cx_left_width: i32,
+        cx_right_width: i32,
+        cy_top_height: i32,
+        cy_bottom_height: i32,
+    }
+
+    type DwmExtendFrameIntoClientAreaFn = unsafe extern "system" fn(
+        hwnd: *mut std::ffi::c_void,
+        p_mar_inset: *const Margins,
+    ) -> i32;
+
     type DwmSetWindowAttributeFn = unsafe extern "system" fn(
         hwnd: *mut std::ffi::c_void,
         dw_attribute: u32,
@@ -306,18 +320,76 @@ fn configure_windows_window(hwnd: *mut std::ffi::c_void) {
         cb_attribute: u32,
     ) -> i32;
 
+    type GetWindowLongPtrWFn =
+        unsafe extern "system" fn(hwnd: *mut std::ffi::c_void, n_index: i32) -> isize;
+
+    type SetWindowLongPtrWFn = unsafe extern "system" fn(
+        hwnd: *mut std::ffi::c_void,
+        n_index: i32,
+        dw_new_long: isize,
+    ) -> isize;
+
+    type SetLayeredWindowAttributesFn = unsafe extern "system" fn(
+        hwnd: *mut std::ffi::c_void,
+        cr_key: u32,
+        b_alpha: u8,
+        dw_flags: u32,
+    ) -> i32;
+
+    type SetClassLongPtrWFn = unsafe extern "system" fn(
+        hwnd: *mut std::ffi::c_void,
+        n_index: i32,
+        dw_new_long: isize,
+    ) -> usize;
+
+    type GetStockObjectFn = unsafe extern "system" fn(i: i32) -> *mut std::ffi::c_void;
+
+    type SetWindowPosFn = unsafe extern "system" fn(
+        hwnd: *mut std::ffi::c_void,
+        hwnd_insert_after: *mut std::ffi::c_void,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    ) -> i32;
+
     extern "system" {
         fn LoadLibraryA(lp_lib_file_name: *const u8) -> *mut std::ffi::c_void;
         fn GetProcAddress(
             h_module: *mut std::ffi::c_void,
             lp_proc_name: *const u8,
-        ) -> Option<DwmSetWindowAttributeFn>;
+        ) -> *mut std::ffi::c_void;
     }
 
     unsafe {
         let dwmapi = LoadLibraryA(b"dwmapi.dll\0".as_ptr());
         if !dwmapi.is_null() {
-            if let Some(set_attr) = GetProcAddress(dwmapi, b"DwmSetWindowAttribute\0".as_ptr()) {
+            let extend_proc = GetProcAddress(dwmapi, b"DwmExtendFrameIntoClientArea\0".as_ptr());
+            if !extend_proc.is_null() {
+                let extend_frame: DwmExtendFrameIntoClientAreaFn = std::mem::transmute(extend_proc);
+                let margins = Margins {
+                    cx_left_width: -1,
+                    cx_right_width: -1,
+                    cy_top_height: -1,
+                    cy_bottom_height: -1,
+                };
+                let _ = extend_frame(hwnd, &margins);
+            }
+
+            let set_attr_proc = GetProcAddress(dwmapi, b"DwmSetWindowAttribute\0".as_ptr());
+            if !set_attr_proc.is_null() {
+                let set_attr: DwmSetWindowAttributeFn = std::mem::transmute(set_attr_proc);
+
+                const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
+                let force_disable: u32 = 1;
+                let _ = set_attr(
+                    hwnd,
+                    DWMWA_TRANSITIONS_FORCEDISABLED,
+                    &force_disable as *const u32 as *const std::ffi::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
+
                 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
                 const DWMWCP_DONOTROUND: u32 = 1;
                 let corner_pref: u32 = DWMWCP_DONOTROUND;
@@ -336,6 +408,87 @@ fn configure_windows_window(hwnd: *mut std::ffi::c_void) {
                     DWMWA_BORDER_COLOR,
                     &border_color as *const u32 as *const std::ffi::c_void,
                     std::mem::size_of::<u32>() as u32,
+                );
+            }
+        }
+
+        let user32 = LoadLibraryA(b"user32.dll\0".as_ptr());
+        let gdi32 = LoadLibraryA(b"gdi32.dll\0".as_ptr());
+
+        if !user32.is_null() {
+            let get_long_proc = {
+                let p = GetProcAddress(user32, b"GetWindowLongPtrW\0".as_ptr());
+                if !p.is_null() {
+                    p
+                } else {
+                    GetProcAddress(user32, b"GetWindowLongW\0".as_ptr())
+                }
+            };
+            let set_long_proc = {
+                let p = GetProcAddress(user32, b"SetWindowLongPtrW\0".as_ptr());
+                if !p.is_null() {
+                    p
+                } else {
+                    GetProcAddress(user32, b"SetWindowLongW\0".as_ptr())
+                }
+            };
+            let set_layered_proc =
+                GetProcAddress(user32, b"SetLayeredWindowAttributes\0".as_ptr());
+
+            const GWL_EXSTYLE: i32 = -20;
+            const WS_EX_LAYERED: isize = 0x00080000;
+            const LWA_ALPHA: u32 = 2;
+
+            if !get_long_proc.is_null() && !set_long_proc.is_null() {
+                let get_long: GetWindowLongPtrWFn = std::mem::transmute(get_long_proc);
+                let set_long: SetWindowLongPtrWFn = std::mem::transmute(set_long_proc);
+                let current_ex_style = get_long(hwnd, GWL_EXSTYLE);
+                let _ = set_long(hwnd, GWL_EXSTYLE, current_ex_style | WS_EX_LAYERED);
+            }
+
+            if !set_layered_proc.is_null() {
+                let set_layered: SetLayeredWindowAttributesFn =
+                    std::mem::transmute(set_layered_proc);
+                let _ = set_layered(hwnd, 0, 255, LWA_ALPHA);
+            }
+
+            if !gdi32.is_null() {
+                let stock_proc = GetProcAddress(gdi32, b"GetStockObject\0".as_ptr());
+                let set_class_proc = {
+                    let p = GetProcAddress(user32, b"SetClassLongPtrW\0".as_ptr());
+                    if !p.is_null() {
+                        p
+                    } else {
+                        GetProcAddress(user32, b"SetClassLongW\0".as_ptr())
+                    }
+                };
+
+                if !stock_proc.is_null() && !set_class_proc.is_null() {
+                    let get_stock_object: GetStockObjectFn = std::mem::transmute(stock_proc);
+                    let set_class_long: SetClassLongPtrWFn = std::mem::transmute(set_class_proc);
+                    const BLACK_BRUSH: i32 = 4;
+                    const GCLP_HBRBACKGROUND: i32 = -10;
+                    let black_brush = get_stock_object(BLACK_BRUSH);
+                    let _ = set_class_long(hwnd, GCLP_HBRBACKGROUND, black_brush as isize);
+                }
+            }
+
+            let set_pos_proc = GetProcAddress(user32, b"SetWindowPos\0".as_ptr());
+            if !set_pos_proc.is_null() {
+                let set_pos: SetWindowPosFn = std::mem::transmute(set_pos_proc);
+                const SWP_NOSIZE: u32 = 0x0001;
+                const SWP_NOMOVE: u32 = 0x0002;
+                const SWP_NOZORDER: u32 = 0x0004;
+                const SWP_NOACTIVATE: u32 = 0x0010;
+                const SWP_FRAMECHANGED: u32 = 0x0020;
+                let _ = set_pos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
                 );
             }
         }
@@ -1033,8 +1186,7 @@ impl eframe::App for IsleApp {
         }
 
         let anim_id = egui::Id::new("isle_expansion_anim");
-        let raw_t = ctx.animate_bool_with_time(anim_id, self.expanded, 0.22);
-        let t = expand_progress(raw_t);
+        let raw_t = ctx.animate_bool_with_time(anim_id, self.expanded, 0.16);
 
         if !self.expanded && self.current_viewport_is_expanded && raw_t <= 0.001 {
             self.resize(ctx, false);
@@ -1055,31 +1207,20 @@ impl eframe::App for IsleApp {
                     Stroke::new(1.2_f32, ISLAND_BORDER),
                 );
 
-                if t < 0.35 {
+                if raw_t <= 0.05 {
                     let pill_content_rect = Rect::from_min_size(
                         island_rect.min,
                         vec2(PILL_WIDTH - 2.0, PILL_HEIGHT - 2.0),
                     );
-                    let opacity = if t <= 0.1 {
-                        1.0
-                    } else {
-                        ((0.35 - t) / 0.25).clamp(0.0, 1.0)
-                    };
                     ui.allocate_new_ui(
                         egui::UiBuilder::new().max_rect(pill_content_rect),
                         |ui| {
-                            ui.set_clip_rect(island_rect);
-                            ui.set_opacity(opacity);
                             self.collapsed(ui, ctx);
                         },
                     );
                 } else {
                     let content_rect = island_rect.shrink(16.0);
-                    let opacity = if t >= 0.7 {
-                        1.0
-                    } else {
-                        ((t - 0.35) / 0.35).clamp(0.0, 1.0)
-                    };
+                    let opacity = (raw_t * 1.2).clamp(0.0, 1.0);
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
                         ui.set_clip_rect(island_rect);
                         ui.set_opacity(opacity);
