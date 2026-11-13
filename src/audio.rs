@@ -1,9 +1,10 @@
+#[cfg(not(windows))]
+use crate::media_keys::MediaKeyManager;
 use crate::{
     extractor::{
         canonical_title, fetch_related_tracks, is_ytdlp_available, resolve_input,
         resolve_stream_info, ExtractorError,
     },
-    media_keys::MediaKeyManager,
     models::{AppConfig, AudioCommand, PlayerState, TrackItem},
 };
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
@@ -819,6 +820,7 @@ pub fn spawn_audio_worker(
 ) -> (Sender<AudioCommand>, Receiver<PlayerState>) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (state_tx, state_rx) = mpsc::channel();
+    #[cfg(not(windows))]
     let media_tx = cmd_tx.clone();
     std::thread::spawn(move || {
         let mut state = PlayerState::default();
@@ -843,7 +845,9 @@ pub fn spawn_audio_worker(
             play_when_ready: false,
             activation_pending: false,
         };
+        #[cfg(not(windows))]
         let mut media_keys = MediaKeyManager::new(media_tx);
+        #[cfg(not(windows))]
         media_keys.sync_state(&worker.state);
         let mut last_published_state = worker.state.clone();
         let mut running = true;
@@ -898,6 +902,7 @@ pub fn spawn_audio_worker(
                 });
             }
             if worker.state != last_published_state {
+                #[cfg(not(windows))]
                 if media_state_changed(&last_published_state, &worker.state) {
                     media_keys.sync_state(&worker.state);
                 }
@@ -911,7 +916,7 @@ pub fn spawn_audio_worker(
     (cmd_tx, state_rx)
 }
 
-fn media_state_changed(previous: &PlayerState, current: &PlayerState) -> bool {
+pub(crate) fn media_state_changed(previous: &PlayerState, current: &PlayerState) -> bool {
     previous.current_track != current.current_track || previous.is_playing != current.is_playing
 }
 
@@ -964,6 +969,9 @@ mod tests {
                         Err(error) => panic!("test server accept failed: {error}"),
                     }
                 };
+                // Windows and macOS inherit the listener's non-blocking mode on
+                // accepted sockets, unlike Linux, so restore blocking reads.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
@@ -1123,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn media_state_sync_ignores_elapsed_time_but_detects_stop() {
+    fn media_state_sync_only_detects_track_or_playback_changes() {
         let mut playing = PlayerState {
             current_track: Some(track("playing")),
             is_playing: true,
@@ -1133,6 +1141,17 @@ mod tests {
 
         playing.elapsed_secs = 1;
         assert!(!media_state_changed(&previous, &playing));
+
+        playing.status_message = Some("Buffering".to_owned());
+        assert!(!media_state_changed(&previous, &playing));
+
+        let mut paused = playing.clone();
+        paused.is_playing = false;
+        assert!(media_state_changed(&playing, &paused));
+
+        let mut next_track = paused.clone();
+        next_track.current_track = Some(track("next"));
+        assert!(media_state_changed(&paused, &next_track));
 
         let mut stopped = playing.clone();
         stopped.current_track = None;
