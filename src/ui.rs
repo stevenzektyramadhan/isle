@@ -13,6 +13,7 @@ pub const PILL_WIDTH: f32 = 290.0;
 pub const PILL_HEIGHT: f32 = 54.0;
 pub const EXPANDED_WIDTH: f32 = 360.0;
 pub const EXPANDED_HEIGHT: f32 = 320.0;
+const ZOOM_AMOUNT: f32 = 0.18;
 
 pub const BG_ISLAND: Color32 = Color32::from_rgb(0x0c, 0x0a, 0x16);
 pub const BORDER_ISLAND: Color32 = Color32::from_rgb(0x23, 0x1f, 0x33);
@@ -39,6 +40,17 @@ pub fn target_window_size(expanded: bool) -> Vec2 {
     } else {
         vec2(PILL_WIDTH, PILL_HEIGHT)
     }
+}
+pub fn expand_progress(raw_t: f32) -> f32 {
+    let clamped = raw_t.clamp(0.0, 1.0);
+    clamped * clamped * (3.0 - 2.0 * clamped)
+}
+pub fn island_dimensions(progress: f32) -> (Vec2, f32) {
+    let t = expand_progress(progress);
+    let width = PILL_WIDTH + (EXPANDED_WIDTH - PILL_WIDTH) * t;
+    let height = PILL_HEIGHT + (EXPANDED_HEIGHT - PILL_HEIGHT) * t;
+    let rounding = 27.0 + (26.0 - 27.0) * t;
+    (vec2(width, height), rounding)
 }
 pub fn transport_labels(autoplay: bool, queue_len: usize) -> (&'static str, String) {
     (
@@ -283,12 +295,143 @@ fn paint_disc(painter: &egui::Painter, rect: Rect, anim_t: Option<f64>) {
     }
 }
 
+#[cfg(windows)]
+fn configure_windows_window(hwnd: *mut std::ffi::c_void) {
+    if hwnd.is_null() {
+        return;
+    }
+
+    type DwmSetWindowAttributeFn = unsafe extern "system" fn(
+        hwnd: *mut std::ffi::c_void,
+        dw_attribute: u32,
+        pv_attribute: *const std::ffi::c_void,
+        cb_attribute: u32,
+    ) -> i32;
+
+    type SetWindowPosFn = unsafe extern "system" fn(
+        hwnd: *mut std::ffi::c_void,
+        hwnd_insert_after: *mut std::ffi::c_void,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    ) -> i32;
+
+    extern "system" {
+        fn LoadLibraryA(lp_lib_file_name: *const u8) -> *mut std::ffi::c_void;
+        fn GetProcAddress(
+            h_module: *mut std::ffi::c_void,
+            lp_proc_name: *const u8,
+        ) -> *mut std::ffi::c_void;
+    }
+
+    unsafe {
+        let dwmapi = LoadLibraryA(b"dwmapi.dll\0".as_ptr());
+        if !dwmapi.is_null() {
+            let set_attr_proc = GetProcAddress(dwmapi, b"DwmSetWindowAttribute\0".as_ptr());
+            if !set_attr_proc.is_null() {
+                let set_attr: DwmSetWindowAttributeFn = std::mem::transmute(set_attr_proc);
+
+                const DWMWA_TRANSITIONS_FORCEDISABLED: u32 = 3;
+                let force_disable: u32 = 1;
+                let _ = set_attr(
+                    hwnd,
+                    DWMWA_TRANSITIONS_FORCEDISABLED,
+                    &force_disable as *const u32 as *const std::ffi::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
+
+                const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+                const DWMWCP_DONOTROUND: u32 = 1;
+                let corner_pref: u32 = DWMWCP_DONOTROUND;
+                let _ = set_attr(
+                    hwnd,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    &corner_pref as *const u32 as *const std::ffi::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
+
+                const DWMWA_BORDER_COLOR: u32 = 34;
+                const DWMWA_COLOR_NONE: u32 = 0xFFFFFFFE;
+                let border_color: u32 = DWMWA_COLOR_NONE;
+                let _ = set_attr(
+                    hwnd,
+                    DWMWA_BORDER_COLOR,
+                    &border_color as *const u32 as *const std::ffi::c_void,
+                    std::mem::size_of::<u32>() as u32,
+                );
+            }
+        }
+
+        let user32 = LoadLibraryA(b"user32.dll\0".as_ptr());
+
+        if !user32.is_null() {
+            let set_pos_proc = GetProcAddress(user32, b"SetWindowPos\0".as_ptr());
+            if !set_pos_proc.is_null() {
+                let set_pos: SetWindowPosFn = std::mem::transmute(set_pos_proc);
+                const SWP_NOSIZE: u32 = 0x0001;
+                const SWP_NOMOVE: u32 = 0x0002;
+                const SWP_NOZORDER: u32 = 0x0004;
+                const SWP_NOACTIVATE: u32 = 0x0010;
+                const SWP_FRAMECHANGED: u32 = 0x0020;
+                let _ = set_pos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
+    }
+}
+
+/// Clips the native window to a rounded rectangle (physical pixels).
+/// Guarantees no opaque/black corner pixels regardless of GPU/driver alpha support.
+#[cfg(windows)]
+fn set_windows_window_region(hwnd: *mut std::ffi::c_void, rect_px: [i32; 4], radius_px: i32) {
+    if hwnd.is_null() {
+        return;
+    }
+    extern "system" {
+        fn CreateRoundRectRgn(
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+            width: i32,
+            height: i32,
+        ) -> *mut std::ffi::c_void;
+        fn SetWindowRgn(
+            hwnd: *mut std::ffi::c_void,
+            h_rgn: *mut std::ffi::c_void,
+            b_redraw: i32,
+        ) -> i32;
+    }
+    let [l, t, r, b] = rect_px;
+    unsafe {
+        let region = CreateRoundRectRgn(l, t, r, b, radius_px * 2, radius_px * 2);
+        if !region.is_null() {
+            // The system owns `region` after a successful call.
+            let _ = SetWindowRgn(hwnd, region, 1);
+        }
+    }
+}
+
 pub struct IsleApp {
     cmd_tx: Sender<AudioCommand>,
     state_rx: Receiver<PlayerState>,
     state: PlayerState,
     config: AppConfig,
     expanded: bool,
+    current_viewport_is_expanded: bool,
+    #[cfg(windows)]
+    hwnd: Option<*mut std::ffi::c_void>,
+    #[cfg(windows)]
+    last_region: Option<([i32; 4], i32)>,
     search_query: String,
     last_window_pos: Option<Pos2>,
     muted_volume: Option<f32>,
@@ -308,17 +451,19 @@ impl IsleApp {
         #[cfg(not(windows))]
         let _ = cc;
         #[cfg(windows)]
-        let mut media_keys = MediaKeyManager::new(
-            cmd_tx.clone(),
-            cc.window_handle()
-                .ok()
-                .and_then(|handle| match handle.as_raw() {
-                    RawWindowHandle::Win32(handle) => {
-                        Some(handle.hwnd.get() as *mut std::ffi::c_void)
-                    }
-                    _ => None,
-                }),
-        );
+        let hwnd = cc
+            .window_handle()
+            .ok()
+            .and_then(|handle| match handle.as_raw() {
+                RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as *mut std::ffi::c_void),
+                _ => None,
+            });
+        #[cfg(windows)]
+        if let Some(h) = hwnd {
+            configure_windows_window(h);
+        }
+        #[cfg(windows)]
+        let mut media_keys = MediaKeyManager::new(cmd_tx.clone(), hwnd);
         #[cfg(windows)]
         media_keys.sync_state(&PlayerState::default());
         Self {
@@ -327,6 +472,11 @@ impl IsleApp {
             state: PlayerState::default(),
             config,
             expanded: false,
+            current_viewport_is_expanded: false,
+            #[cfg(windows)]
+            hwnd,
+            #[cfg(windows)]
+            last_region: None,
             search_query: String::new(),
             last_window_pos: None,
             muted_volume: None,
@@ -341,6 +491,16 @@ impl IsleApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target_window_size(
             expanded,
         )));
+    }
+
+    fn set_expanded(&mut self, ctx: &egui::Context, expanded: bool) {
+        if self.expanded != expanded {
+            self.expanded = expanded;
+            if expanded && !self.current_viewport_is_expanded {
+                self.resize(ctx, true);
+                self.current_viewport_is_expanded = true;
+            }
+        }
     }
 
     fn mark_config_dirty(&mut self) {
@@ -427,8 +587,7 @@ impl IsleApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
         if bg_resp.clicked() {
-            self.expanded = true;
-            self.resize(ctx, true);
+            self.set_expanded(ctx, true);
         }
         let play_resp = ui.allocate_rect(btn_rect, Sense::click());
         let play_hovered = play_resp.hovered();
@@ -532,8 +691,7 @@ impl IsleApp {
                     TEXT_SECONDARY,
                 );
                 if c_resp.on_hover_text("Minimize to Pill (Esc)").clicked() {
-                    self.expanded = false;
-                    self.resize(ctx, false);
+                    self.set_expanded(ctx, false);
                 }
                 let status_label = if self.state.is_playing {
                     "PLAYING"
@@ -905,12 +1063,10 @@ impl eframe::App for IsleApp {
             )
         });
         if escape {
-            self.expanded = false;
-            self.resize(ctx, false);
+            self.set_expanded(ctx, false);
         }
         if toggle {
-            self.expanded = !self.expanded;
-            self.resize(ctx, self.expanded);
+            self.set_expanded(ctx, !self.expanded);
         }
         if !ctx.wants_keyboard_input() {
             if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
@@ -960,29 +1116,109 @@ impl eframe::App for IsleApp {
                 self.mark_config_dirty();
             }
         }
+
+        let anim_id = egui::Id::new("isle_expansion_anim");
+        let raw_t = ctx.animate_bool_with_time(anim_id, self.expanded, 0.22);
+        let t = expand_progress(raw_t);
+
+        if !self.expanded && self.current_viewport_is_expanded && raw_t <= 0.001 {
+            self.resize(ctx, false);
+            self.current_viewport_is_expanded = false;
+        }
+
+        let (current_size, rounding) = island_dimensions(raw_t);
+        let origin = pos2(1.0, 1.0);
+        let island_rect = Rect::from_min_size(origin, current_size - vec2(2.0, 2.0));
+
+        #[cfg(windows)]
+        if let Some(hwnd) = self.hwnd {
+            let ppp = ctx.pixels_per_point();
+            let outer = island_rect.expand(0.6);
+            let region = (
+                [
+                    (outer.left() * ppp).round() as i32,
+                    (outer.top() * ppp).round() as i32,
+                    (outer.right() * ppp).round() as i32,
+                    (outer.bottom() * ppp).round() as i32,
+                ],
+                ((rounding + 0.6) * ppp).round() as i32,
+            );
+            if self.last_region != Some(region) {
+                set_windows_window_region(hwnd, region.0, region.1);
+                self.last_region = Some(region);
+            }
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
-                let panel = ui.max_rect().shrink(1.0);
-                let (rounding, content) = if self.expanded {
-                    (26.0, panel.shrink(16.0))
-                } else {
-                    (27.0, panel)
-                };
                 ui.painter().rect(
-                    panel,
+                    island_rect,
                     Rounding::same(rounding),
                     ISLAND_BG,
                     Stroke::new(1.2_f32, ISLAND_BORDER),
                 );
-                ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content), |ui| {
-                    if self.expanded {
-                        self.expanded(ui, ctx);
-                    } else {
-                        self.collapsed(ui, ctx);
-                    }
-                });
             });
+
+        // Zoom transition: the pill zooms in and fades out while the dashboard zooms in from
+        // slightly smaller; collapsing plays the same thing in reverse.
+        let island_center = island_rect.center();
+        let zoom_transform = |layout_center: Pos2, scale: f32| {
+            if (scale - 1.0).abs() < 1e-4 {
+                egui::emath::TSTransform::IDENTITY
+            } else {
+                egui::emath::TSTransform::new(
+                    island_center.to_vec2() - layout_center.to_vec2() * scale,
+                    scale,
+                )
+            }
+        };
+
+        let pill_id = egui::Id::new("isle_pill_area");
+        let dash_id = egui::Id::new("isle_dashboard_area");
+        let pill_layer = egui::LayerId::new(egui::Order::Middle, pill_id);
+        let dash_layer = egui::LayerId::new(egui::Order::Middle, dash_id);
+
+        if t < 0.5 {
+            let k = t * 2.0;
+            let pill_rect = Rect::from_min_size(origin, vec2(PILL_WIDTH - 2.0, PILL_HEIGHT - 2.0));
+            let transform = zoom_transform(pill_rect.center(), 1.0 + ZOOM_AMOUNT * k);
+            ctx.set_transform_layer(pill_layer, transform);
+            let clip = transform.inverse() * island_rect;
+            egui::Area::new(pill_id)
+                .order(egui::Order::Middle)
+                .fixed_pos(Pos2::ZERO)
+                .constrain(false)
+                .show(ctx, |ui| {
+                    ui.set_clip_rect(clip);
+                    ui.set_opacity(1.0 - k);
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(pill_rect), |ui| {
+                        self.collapsed(ui, ctx);
+                    });
+                });
+        }
+        if t > 0.3 {
+            let k = ((t - 0.3) / 0.7).clamp(0.0, 1.0);
+            let final_rect =
+                Rect::from_min_size(origin, vec2(EXPANDED_WIDTH - 2.0, EXPANDED_HEIGHT - 2.0));
+            let transform = zoom_transform(final_rect.center(), 1.0 - ZOOM_AMOUNT * (1.0 - k));
+            ctx.set_transform_layer(dash_layer, transform);
+            let clip = transform.inverse() * island_rect;
+            egui::Area::new(dash_id)
+                .order(egui::Order::Middle)
+                .fixed_pos(Pos2::ZERO)
+                .constrain(false)
+                .show(ctx, |ui| {
+                    ui.set_clip_rect(clip);
+                    ui.set_opacity(k);
+                    ui.allocate_new_ui(
+                        egui::UiBuilder::new().max_rect(final_rect.shrink(16.0)),
+                        |ui| {
+                            self.expanded(ui, ctx);
+                        },
+                    );
+                });
+        }
         self.save_config_if_dirty();
     }
 
@@ -1019,5 +1255,19 @@ mod tests {
             ("AUTO ON", "CLR (12)".to_owned())
         );
         assert_eq!(transport_labels(false, 0), ("AUTO OFF", "CLEAR".to_owned()));
+    }
+    #[test]
+    fn calculates_expansion_progress_and_dimensions() {
+        assert_eq!(expand_progress(0.0), 0.0);
+        assert_eq!(expand_progress(1.0), 1.0);
+        assert_eq!(expand_progress(0.5), 0.5);
+
+        let (size_collapsed, radius_collapsed) = island_dimensions(0.0);
+        assert_eq!(size_collapsed, vec2(PILL_WIDTH, PILL_HEIGHT));
+        assert_eq!(radius_collapsed, 27.0);
+
+        let (size_expanded, radius_expanded) = island_dimensions(1.0);
+        assert_eq!(size_expanded, vec2(EXPANDED_WIDTH, EXPANDED_HEIGHT));
+        assert_eq!(radius_expanded, 26.0);
     }
 }

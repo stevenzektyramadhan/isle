@@ -6,6 +6,10 @@ pub mod models;
 pub mod ui;
 
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    unsafe {
+        std::env::set_var("WGPU_DX12_PRESENTATION_SYSTEM", "Visual");
+    }
     let config = config::load_config();
     let (cmd_tx, state_rx) = audio::spawn_audio_worker(config.clone());
     let mut viewport = eframe::egui::ViewportBuilder::default()
@@ -19,6 +23,7 @@ fn main() -> eframe::Result<()> {
     }
     let native_options = eframe::NativeOptions {
         viewport,
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
     eframe::run_native(
