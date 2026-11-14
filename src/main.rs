@@ -1,3 +1,8 @@
+// Release builds are GUI-only: without this, Windows opens a console window
+// next to the island whenever isle.exe is double-clicked. Debug builds keep the
+// console attached so logs stay visible.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 pub mod audio;
 pub mod config;
 pub mod extractor;
@@ -16,6 +21,11 @@ fn main() -> eframe::Result<()> {
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top()
+        .with_icon(eframe::egui::IconData {
+            rgba: include_bytes!("../assets/isle_64.rgba").to_vec(),
+            width: 64,
+            height: 64,
+        })
         .with_inner_size([ui::PILL_WIDTH, ui::PILL_HEIGHT])
         .with_resizable(false);
     if let (Some(x), Some(y)) = (config.window_x, config.window_y) {
