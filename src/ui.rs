@@ -676,6 +676,39 @@ impl IsleApp {
                 TEXT_PRIMARY,
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (x_rect, x_resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                let x_hovered = x_resp.hovered();
+                ui.painter().circle(
+                    x_rect.center(),
+                    11.0,
+                    if x_hovered {
+                        Color32::from_rgb(0x3a, 0x1d, 0x2a)
+                    } else {
+                        SURFACE_SUBTLE
+                    },
+                    Stroke::new(
+                        1.0_f32,
+                        if x_hovered {
+                            Color32::from_rgb(0x7a, 0x2f, 0x44)
+                        } else {
+                            SURFACE_BORDER
+                        },
+                    ),
+                );
+                ui.painter().text(
+                    x_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "✕",
+                    egui::FontId::proportional(11.0),
+                    if x_hovered {
+                        Color32::from_rgb(0xf8, 0x71, 0x71)
+                    } else {
+                        TEXT_SECONDARY
+                    },
+                );
+                if x_resp.on_hover_text("Close Isle").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 let (c_rect, c_resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
                 ui.painter().circle(
                     c_rect.center(),
