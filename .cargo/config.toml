@@ -1,0 +1,6 @@
+# The release bundle ships isle.exe as a self-contained portable binary, so the
+# Windows build must not depend on the Visual C++ Redistributable. Linking the
+# CRT statically removes the vcruntime140.dll / vcruntime140_1.dll / msvcp140.dll
+# imports that a default MSVC build emits.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
