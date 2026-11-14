@@ -65,6 +65,10 @@ Aplikasi ini dirancang untuk mendengarkan lagu secara langsung tanpa browser, ta
 
 ## 🚀 Cara Instalasi & Menjalankan
 
+### Installer Windows (disarankan)
+
+Unduh `Isle-Setup-x64.exe` dari halaman release, jalankan, lalu ikuti wizard. Installer bersifat per-user: tidak memerlukan hak administrator dan memasang Isle di `%LOCALAPPDATA%\Programs\Isle`. Installer menyertakan `isle.exe` dan `yt-dlp.exe`, membuat shortcut Start Menu beserta opsi ikon Desktop, dan mendaftarkan uninstaller di Settings > Apps. Setelah terpasang, jalankan Isle dari shortcut tersebut; tidak ada jendela terminal yang ikut terbuka.
+
 ### Bundle Portabel Windows
 
 Bundle portabel berisi `isle.exe`, `yt-dlp.exe`, dan `README.txt` dalam satu folder. Extract ZIP, jangan pisahkan kedua file `.exe`, lalu double-click `isle.exe`. Bundle ini tidak memerlukan Rust, Cargo, Visual Studio, Visual C++ Redistributable, hak administrator, atau pengaturan `PATH`; `yt-dlp.exe` sudah disertakan. Koneksi internet tetap diperlukan. Config Windows disimpan di `%APPDATA%\isle\config.json`.
@@ -86,7 +90,7 @@ cargo run
 ```bash
 cargo build --release
 ```
-Binary berada di `target/release/isle` pada Linux dan macOS, atau `target\release\isle.exe` pada Windows.
+Binary berada di `target/release/isle` pada Linux dan macOS, atau `target\release\isle.exe` pada Windows. Build `--release` di Windows memakai subsystem GUI, sehingga double-click `isle.exe` tidak membuka jendela konsol; build debug tetap menampilkan konsol untuk log.
 ```bash
 # Linux / macOS:
 ./target/release/isle
@@ -117,7 +121,7 @@ Saat dijalankan, Isle muncul sebagai kapsul kecil di layar.
 ### 2. Interaksi Dashboard (Expanded - `360x320 dp`)
 ```
 ┌──────────────────────────────────────────────────┐
-│ ● Isle                         [ PLAYING ]  ⌄    │
+│ ● Isle                       [ PLAYING ]  ⌄  ✕ │
 │                                                  │
 │  ╭────╮  Terpukau                                │
 │  │ ◉  │  Astrid                                  │
@@ -135,6 +139,8 @@ Saat dijalankan, Isle muncul sebagai kapsul kecil di layar.
 #### Penjelasan Setiap Tombol:
 | Tombol / Elemen | Fungsi |
 |---|---|
+| **`⌄`** | Menciutkan dashboard kembali menjadi pill. |
+| **`✕`** | Menutup aplikasi Isle sepenuhnya. |
 | **`⏮` (Previous)** | Memutar track sebelumnya dari history; track saat ini didorong ke depan queue. Jika history kosong, tidak terjadi apa-apa (tidak mengulang track saat ini). |
 | **`▶` / `⏸` (Play / Pause)** | Memulai, menjeda, atau melanjutkan track. |
 | **`⏭` (Next)** | Mengambil track berikutnya dari queue. |
