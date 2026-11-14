@@ -10,7 +10,7 @@ Cara menjalankan:
 2. Jangan pisahkan isle.exe dan yt-dlp.exe. Keduanya harus tetap berada di folder yang sama.
 3. Double-click isle.exe untuk menjalankan Isle.
 
-Bundle ini sudah menyertakan yt-dlp.exe dan otomatis terdeteksi dari folder yang sama, sehingga tidak memerlukan Rust, Cargo, Visual Studio, hak administrator, atau pengaturan PATH.
+Bundle ini sudah menyertakan yt-dlp.exe dan otomatis terdeteksi dari folder yang sama, sehingga tidak memerlukan Rust, Cargo, Visual Studio, Visual C++ Redistributable, hak administrator, atau pengaturan PATH.
 
 Koneksi internet diperlukan untuk mencari dan memutar audio.
 
