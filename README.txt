@@ -8,6 +8,10 @@ CARA MEMASANG (DISARANKAN)
 
 Saat aplikasi berjalan, klik pill untuk membuka dashboard, lalu gunakan tombol tutup (X) di kanan atas dashboard untuk keluar.
 
+UPDATE OTOMATIS
+
+Versi terpasang mengecek rilis terbaru maksimal sekali sehari. Saat ada versi baru, badge UPDATE muncul di dashboard; klik untuk mengunduh, memverifikasi, dan memasangnya. Isle akan menutup dan terbuka lagi otomatis, dan pengaturan Anda tetap tersimpan.
+
 Mencabut pemasangan: Settings > Apps > Isle > Uninstall, atau jalankan unins000.exe di folder pemasangan.
 
 BUNDLE PORTABEL (ALTERNATIF)

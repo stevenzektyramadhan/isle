@@ -50,6 +50,13 @@ jobs:
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.*)"').Matches[0].Groups[1].Value
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" "installer\isle.iss"
+      - name: Write update manifest
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.*)"').Matches[0].Groups[1].Value
+          $sha = (Get-FileHash dist/Isle-Setup-x64.exe -Algorithm SHA256).Hash.ToLower()
+          $json = @{ version = $version; sha256 = $sha } | ConvertTo-Json -Compress
+          [System.IO.File]::WriteAllText("$PWD/dist/latest.json", $json)
       - name: Assemble portable bundle
         shell: pwsh
         run: |
@@ -67,7 +74,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: isle-windows-setup
-          path: dist/Isle-Setup-x64.exe
+          path: |
+            dist/Isle-Setup-x64.exe
+            dist/latest.json
           if-no-files-found: error
 
   linux:

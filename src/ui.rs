@@ -1,5 +1,5 @@
-use std::sync::mpsc::{Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, pos2, vec2, Color32, Pos2, Rect, Rounding, Sense, Stroke, Vec2};
 #[cfg(windows)]
@@ -8,6 +8,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(windows)]
 use crate::media_keys::MediaKeyManager;
 use crate::models::{AppConfig, AudioCommand, PlayerState};
+use crate::updater::UpdateManifest;
 
 pub const PILL_WIDTH: f32 = 290.0;
 pub const PILL_HEIGHT: f32 = 54.0;
@@ -88,6 +89,32 @@ fn pill_badge(ui: &mut egui::Ui, text: &str, dark: bool) {
         .show(ui, |ui| {
             ui.label(egui::RichText::new(text).size(9.5).strong().color(fg));
         });
+}
+
+fn update_badge(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    egui::Frame::none()
+        .fill(ACCENT_PRIMARY)
+        .rounding(Rounding::same(8.0))
+        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(label)
+                        .size(9.5)
+                        .strong()
+                        .color(TEXT_PRIMARY),
+                )
+                .sense(Sense::click()),
+            )
+        })
+        .inner
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
 
 fn paint_play_pause(painter: &egui::Painter, center: Pos2, playing: bool) {
@@ -473,6 +500,11 @@ pub struct IsleApp {
     muted_volume: Option<f32>,
     config_dirty: bool,
     last_config_save: Instant,
+    update_rx: Receiver<UpdateManifest>,
+    pending_update: Option<UpdateManifest>,
+    install_rx: Option<Receiver<Result<(), String>>>,
+    update_note: Option<String>,
+    installing: bool,
     #[cfg(windows)]
     media_keys: MediaKeyManager,
 }
@@ -482,7 +514,7 @@ impl IsleApp {
         cc: &eframe::CreationContext<'_>,
         cmd_tx: Sender<AudioCommand>,
         state_rx: Receiver<PlayerState>,
-        config: AppConfig,
+        mut config: AppConfig,
     ) -> Self {
         #[cfg(not(windows))]
         let _ = cc;
@@ -502,6 +534,23 @@ impl IsleApp {
         let mut media_keys = MediaKeyManager::new(cmd_tx.clone(), hwnd);
         #[cfg(windows)]
         media_keys.sync_state(&PlayerState::default());
+        let now = unix_now_secs();
+        let update_check_started = !cfg!(debug_assertions)
+            && crate::updater::is_installed()
+            && crate::updater::check_due(config.last_update_check_secs, now);
+        let (update_tx, update_rx) = mpsc::channel();
+        if update_check_started {
+            config.last_update_check_secs = Some(now);
+            let update_tx = update_tx.clone();
+            std::thread::spawn(move || {
+                if let Ok(Some(update)) =
+                    crate::updater::check_for_update(env!("CARGO_PKG_VERSION"))
+                {
+                    let _ = update_tx.send(update);
+                }
+            });
+        }
+        drop(update_tx);
         Self {
             cmd_tx,
             state_rx,
@@ -516,8 +565,13 @@ impl IsleApp {
             search_query: String::new(),
             last_window_pos: None,
             muted_volume: None,
-            config_dirty: false,
+            config_dirty: update_check_started,
             last_config_save: Instant::now(),
+            update_rx,
+            pending_update: None,
+            install_rx: None,
+            update_note: None,
+            installing: false,
             #[cfg(windows)]
             media_keys,
         }
@@ -537,6 +591,24 @@ impl IsleApp {
                 self.current_viewport_is_expanded = true;
             }
         }
+    }
+
+    fn start_update(&mut self) {
+        if self.installing {
+            return;
+        }
+        let Some(update) = self.pending_update.clone() else {
+            return;
+        };
+        let (install_tx, install_rx) = mpsc::channel();
+        self.install_rx = Some(install_rx);
+        self.installing = true;
+        self.update_note = None;
+        std::thread::spawn(move || {
+            let result =
+                crate::updater::download_and_install(&update).map_err(|error| error.to_string());
+            let _ = install_tx.send(result);
+        });
     }
 
     fn mark_config_dirty(&mut self) {
@@ -630,7 +702,13 @@ impl IsleApp {
         if play_resp.on_hover_text("Play / Pause").clicked() {
             let _ = self.cmd_tx.send(AudioCommand::TogglePlayPause);
         }
-        let sub = self.state.status_message.as_deref().unwrap_or(&artist);
+        let sub = if let Some(status) = self.state.status_message.as_deref() {
+            status.to_owned()
+        } else if let Some(update) = self.pending_update.as_ref() {
+            format!("Update v{} available", update.version)
+        } else {
+            artist.clone()
+        };
         paint_disc(
             ui.painter(),
             Rect::from_center_size(pos2(full.left() + 27.0, full.center().y), vec2(34.0, 34.0)),
@@ -655,7 +733,7 @@ impl IsleApp {
                     }
                 });
                 ui.label(
-                    egui::RichText::new(truncate_title(sub, 25))
+                    egui::RichText::new(truncate_title(&sub, 25))
                         .size(11.0)
                         .color(TEXT_SECONDARY),
                 );
@@ -767,12 +845,29 @@ impl IsleApp {
                 if c_resp.on_hover_text("Minimize to Pill (Esc)").clicked() {
                     self.set_expanded(ctx, false);
                 }
-                let status_label = if self.state.is_playing {
-                    "PLAYING"
+                let pending_update = self.pending_update.clone();
+                if let Some(update) = pending_update {
+                    let label = if self.installing {
+                        "UPDATING…".to_owned()
+                    } else {
+                        format!("UPDATE {}", update.version)
+                    };
+                    let hint = self
+                        .update_note
+                        .clone()
+                        .unwrap_or_else(|| format!("Install Isle {}", update.version));
+                    let response = update_badge(ui, &label).on_hover_text(hint);
+                    if response.clicked() && !self.installing {
+                        self.start_update();
+                    }
                 } else {
-                    "IDLE"
-                };
-                pill_badge(ui, status_label, true);
+                    let status_label = if self.state.is_playing {
+                        "PLAYING"
+                    } else {
+                        "IDLE"
+                    };
+                    pill_badge(ui, status_label, true);
+                }
             });
         });
         let (title, artist) = self.track_meta();
@@ -842,7 +937,11 @@ impl IsleApp {
                 ui.painter().circle_filled(knob, 4.5, TEXT_PRIMARY);
             }
             let (ts_rect, _) = ui.allocate_exact_size(vec2(row_w, 14.0), Sense::hover());
-            let mode =
+            let mode = if self.installing {
+                "DOWNLOADING UPDATE"
+            } else if let Some(note) = self.update_note.as_deref() {
+                note
+            } else {
                 self.state
                     .status_message
                     .as_deref()
@@ -850,7 +949,8 @@ impl IsleApp {
                         "AUTOPLAY MIX"
                     } else {
                         "STANDARD"
-                    });
+                    })
+            };
             ui.painter().text(
                 ts_rect.left_center(),
                 egui::Align2::LEFT_CENTER,
@@ -1128,6 +1228,25 @@ impl eframe::App for IsleApp {
         #[cfg(windows)]
         if media_state_changed {
             self.media_keys.sync_state(&self.state);
+        }
+        if let Ok(update) = self.update_rx.try_recv() {
+            self.pending_update = Some(update);
+        }
+        if let Some(install_rx) = self.install_rx.take() {
+            match install_rx.try_recv() {
+                Ok(Ok(())) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Ok(Err(error)) => {
+                    self.installing = false;
+                    self.update_note = Some(error);
+                }
+                Err(TryRecvError::Empty) => self.install_rx = Some(install_rx),
+                Err(TryRecvError::Disconnected) => {
+                    self.installing = false;
+                    self.update_note = Some("Update failed".to_owned());
+                }
+            }
         }
         ctx.request_repaint_after(Duration::from_millis(250));
         let (escape, toggle) = ctx.input(|i| {

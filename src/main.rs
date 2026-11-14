@@ -9,6 +9,7 @@ pub mod extractor;
 pub mod media_keys;
 pub mod models;
 pub mod ui;
+pub mod updater;
 
 fn main() -> eframe::Result<()> {
     #[cfg(windows)]

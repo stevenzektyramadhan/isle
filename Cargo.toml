@@ -12,6 +12,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 souvlaki = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2.0"
 url = "2"
 dirs = "7.0.0"
