@@ -130,6 +130,42 @@ fn paint_skip(painter: &egui::Painter, center: Pos2, next: bool) {
     );
 }
 
+fn paint_chevron_down(painter: &egui::Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.6_f32, color);
+    painter.line_segment(
+        [
+            pos2(center.x - 4.0, center.y - 1.6),
+            pos2(center.x, center.y + 2.4),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            pos2(center.x, center.y + 2.4),
+            pos2(center.x + 4.0, center.y - 1.6),
+        ],
+        stroke,
+    );
+}
+
+fn paint_close_x(painter: &egui::Painter, center: Pos2, color: Color32) {
+    let stroke = Stroke::new(1.7_f32, color);
+    painter.line_segment(
+        [
+            pos2(center.x - 3.4, center.y - 3.4),
+            pos2(center.x + 3.4, center.y + 3.4),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            pos2(center.x + 3.4, center.y - 3.4),
+            pos2(center.x - 3.4, center.y + 3.4),
+        ],
+        stroke,
+    );
+}
+
 fn paint_speaker(painter: &egui::Painter, center: Pos2, high: bool, muted: bool) {
     let col = if muted { TEXT_MUTED } else { TEXT_SECONDARY };
     painter.rect_filled(
@@ -695,11 +731,9 @@ impl IsleApp {
                         },
                     ),
                 );
-                ui.painter().text(
+                paint_close_x(
+                    ui.painter(),
                     x_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "✕",
-                    egui::FontId::proportional(11.0),
                     if x_hovered {
                         Color32::from_rgb(0xf8, 0x71, 0x71)
                     } else {
@@ -710,18 +744,25 @@ impl IsleApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 let (c_rect, c_resp) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::click());
+                let c_hovered = c_resp.hovered();
                 ui.painter().circle(
                     c_rect.center(),
                     11.0,
-                    SURFACE_SUBTLE,
+                    if c_hovered {
+                        SURFACE_BORDER
+                    } else {
+                        SURFACE_SUBTLE
+                    },
                     Stroke::new(1.0_f32, SURFACE_BORDER),
                 );
-                ui.painter().text(
+                paint_chevron_down(
+                    ui.painter(),
                     c_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "⌄",
-                    egui::FontId::proportional(12.0),
-                    TEXT_SECONDARY,
+                    if c_hovered {
+                        TEXT_PRIMARY
+                    } else {
+                        TEXT_SECONDARY
+                    },
                 );
                 if c_resp.on_hover_text("Minimize to Pill (Esc)").clicked() {
                     self.set_expanded(ctx, false);
