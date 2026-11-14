@@ -65,6 +65,18 @@ Aplikasi ini dirancang untuk mendengarkan lagu secara langsung tanpa browser, ta
 
 ## 🚀 Cara Instalasi & Menjalankan
 
+### Installer Windows (disarankan)
+
+Unduh `Isle-Setup-x64.exe` dari halaman release, jalankan, lalu ikuti wizard. Installer bersifat per-user: tidak memerlukan hak administrator dan memasang Isle di `%LOCALAPPDATA%\Programs\Isle`. Installer menyertakan `isle.exe` dan `yt-dlp.exe`, membuat shortcut Start Menu beserta opsi ikon Desktop, dan mendaftarkan uninstaller di Settings > Apps. Setelah terpasang, jalankan Isle dari shortcut tersebut; tidak ada jendela terminal yang ikut terbuka.
+
+### Update Otomatis (khusus versi terpasang)
+
+Isle yang dipasang lewat installer mengecek rilis terbaru maksimal sekali sehari. Saat ada versi baru, badge `UPDATE x.y.z` muncul di dashboard (dan baris status pill menampilkan versi yang tersedia). Klik badge tersebut untuk mengunduh installer baru, memverifikasi SHA-256 dari `latest.json`, lalu memasangnya secara silent; Isle menutup dan terbuka lagi otomatis di versi baru. Config di `%APPDATA%\isle\config.json` tidak berubah.
+
+Jika unduhan atau verifikasi gagal, pesan kesalahan tampil di baris status dan badge bisa diklik lagi. Bundle portabel tidak memakai update otomatis; pengguna portabel tetap memperbarui secara manual.
+
+Saat merilis versi baru, naikkan `version` di `Cargo.toml`, lalu push tag `vX.Y.Z`. Workflow Release membangun installer, menulis `latest.json` berisi versi dan SHA-256 installer, dan mengunggah keduanya ke release; itulah yang dibaca fitur update otomatis.
+
 ### Bundle Portabel Windows
 
 Bundle portabel berisi `isle.exe`, `yt-dlp.exe`, dan `README.txt` dalam satu folder. Extract ZIP, jangan pisahkan kedua file `.exe`, lalu double-click `isle.exe`. Bundle ini tidak memerlukan Rust, Cargo, Visual Studio, Visual C++ Redistributable, hak administrator, atau pengaturan `PATH`; `yt-dlp.exe` sudah disertakan. Koneksi internet tetap diperlukan. Config Windows disimpan di `%APPDATA%\isle\config.json`.
@@ -86,7 +98,7 @@ cargo run
 ```bash
 cargo build --release
 ```
-Binary berada di `target/release/isle` pada Linux dan macOS, atau `target\release\isle.exe` pada Windows.
+Binary berada di `target/release/isle` pada Linux dan macOS, atau `target\release\isle.exe` pada Windows. Build `--release` di Windows memakai subsystem GUI, sehingga double-click `isle.exe` tidak membuka jendela konsol; build debug tetap menampilkan konsol untuk log.
 ```bash
 # Linux / macOS:
 ./target/release/isle
@@ -117,7 +129,7 @@ Saat dijalankan, Isle muncul sebagai kapsul kecil di layar.
 ### 2. Interaksi Dashboard (Expanded - `360x320 dp`)
 ```
 ┌──────────────────────────────────────────────────┐
-│ ● Isle                         [ PLAYING ]  ⌄    │
+│ ● Isle                       [ PLAYING ]  ⌄  ✕ │
 │                                                  │
 │  ╭────╮  Terpukau                                │
 │  │ ◉  │  Astrid                                  │
@@ -135,6 +147,8 @@ Saat dijalankan, Isle muncul sebagai kapsul kecil di layar.
 #### Penjelasan Setiap Tombol:
 | Tombol / Elemen | Fungsi |
 |---|---|
+| **`⌄`** | Menciutkan dashboard kembali menjadi pill. |
+| **`✕`** | Menutup aplikasi Isle sepenuhnya. |
 | **`⏮` (Previous)** | Memutar track sebelumnya dari history; track saat ini didorong ke depan queue. Jika history kosong, tidak terjadi apa-apa (tidak mengulang track saat ini). |
 | **`▶` / `⏸` (Play / Pause)** | Memulai, menjeda, atau melanjutkan track. |
 | **`⏭` (Next)** | Mengambil track berikutnya dari queue. |

@@ -1,4 +1,20 @@
-ISLE, BUNDLE PORTABEL WINDOWS
+ISLE
+
+CARA MEMASANG (DISARANKAN)
+
+1. Jalankan Isle-Setup-x64.exe.
+2. Ikuti wizard pemasangan. Installer tidak memerlukan hak administrator dan memasang Isle per-user di %LOCALAPPDATA%\Programs\Isle.
+3. Setelah selesai, jalankan Isle dari shortcut Start Menu atau ikon Desktop. Tidak ada jendela terminal yang ikut terbuka.
+
+Saat aplikasi berjalan, klik pill untuk membuka dashboard, lalu gunakan tombol tutup (X) di kanan atas dashboard untuk keluar.
+
+UPDATE OTOMATIS
+
+Versi terpasang mengecek rilis terbaru maksimal sekali sehari. Saat ada versi baru, badge UPDATE muncul di dashboard; klik untuk mengunduh, memverifikasi, dan memasangnya. Isle akan menutup dan terbuka lagi otomatis, dan pengaturan Anda tetap tersimpan.
+
+Mencabut pemasangan: Settings > Apps > Isle > Uninstall, atau jalankan unins000.exe di folder pemasangan.
+
+BUNDLE PORTABEL (ALTERNATIF)
 
 Isi folder bundle:
 - isle.exe

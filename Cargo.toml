@@ -1,6 +1,6 @@
 [package]
 name = "isle"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.88"
 
@@ -12,9 +12,13 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 souvlaki = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2.0"
 url = "2"
 dirs = "7.0.0"
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6.2"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

@@ -89,6 +89,7 @@ mod tests {
             volume: 0.75,
             autoplay_enabled: false,
             cookies_browser: None,
+            last_update_check_secs: None,
         };
 
         // When: the configuration is saved then loaded.

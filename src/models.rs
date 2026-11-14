@@ -66,6 +66,8 @@ pub struct AppConfig {
     pub autoplay_enabled: bool,
     #[serde(default)]
     pub cookies_browser: Option<String>,
+    #[serde(default)]
+    pub last_update_check_secs: Option<u64>,
 }
 
 impl Default for AppConfig {
@@ -76,6 +78,7 @@ impl Default for AppConfig {
             volume: 1.0,
             autoplay_enabled: true,
             cookies_browser: None,
+            last_update_check_secs: None,
         }
     }
 }
