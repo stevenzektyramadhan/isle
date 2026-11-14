@@ -13,6 +13,7 @@ pub const PILL_WIDTH: f32 = 290.0;
 pub const PILL_HEIGHT: f32 = 54.0;
 pub const EXPANDED_WIDTH: f32 = 360.0;
 pub const EXPANDED_HEIGHT: f32 = 320.0;
+const ZOOM_AMOUNT: f32 = 0.18;
 
 pub const BG_ISLAND: Color32 = Color32::from_rgb(0x0c, 0x0a, 0x16);
 pub const BORDER_ISLAND: Color32 = Color32::from_rgb(0x23, 0x1f, 0x33);
@@ -300,49 +301,12 @@ fn configure_windows_window(hwnd: *mut std::ffi::c_void) {
         return;
     }
 
-    #[repr(C)]
-    struct Margins {
-        cx_left_width: i32,
-        cx_right_width: i32,
-        cy_top_height: i32,
-        cy_bottom_height: i32,
-    }
-
-    type DwmExtendFrameIntoClientAreaFn = unsafe extern "system" fn(
-        hwnd: *mut std::ffi::c_void,
-        p_mar_inset: *const Margins,
-    ) -> i32;
-
     type DwmSetWindowAttributeFn = unsafe extern "system" fn(
         hwnd: *mut std::ffi::c_void,
         dw_attribute: u32,
         pv_attribute: *const std::ffi::c_void,
         cb_attribute: u32,
     ) -> i32;
-
-    type GetWindowLongPtrWFn =
-        unsafe extern "system" fn(hwnd: *mut std::ffi::c_void, n_index: i32) -> isize;
-
-    type SetWindowLongPtrWFn = unsafe extern "system" fn(
-        hwnd: *mut std::ffi::c_void,
-        n_index: i32,
-        dw_new_long: isize,
-    ) -> isize;
-
-    type SetLayeredWindowAttributesFn = unsafe extern "system" fn(
-        hwnd: *mut std::ffi::c_void,
-        cr_key: u32,
-        b_alpha: u8,
-        dw_flags: u32,
-    ) -> i32;
-
-    type SetClassLongPtrWFn = unsafe extern "system" fn(
-        hwnd: *mut std::ffi::c_void,
-        n_index: i32,
-        dw_new_long: isize,
-    ) -> usize;
-
-    type GetStockObjectFn = unsafe extern "system" fn(i: i32) -> *mut std::ffi::c_void;
 
     type SetWindowPosFn = unsafe extern "system" fn(
         hwnd: *mut std::ffi::c_void,
@@ -365,18 +329,6 @@ fn configure_windows_window(hwnd: *mut std::ffi::c_void) {
     unsafe {
         let dwmapi = LoadLibraryA(b"dwmapi.dll\0".as_ptr());
         if !dwmapi.is_null() {
-            let extend_proc = GetProcAddress(dwmapi, b"DwmExtendFrameIntoClientArea\0".as_ptr());
-            if !extend_proc.is_null() {
-                let extend_frame: DwmExtendFrameIntoClientAreaFn = std::mem::transmute(extend_proc);
-                let margins = Margins {
-                    cx_left_width: -1,
-                    cx_right_width: -1,
-                    cy_top_height: -1,
-                    cy_bottom_height: -1,
-                };
-                let _ = extend_frame(hwnd, &margins);
-            }
-
             let set_attr_proc = GetProcAddress(dwmapi, b"DwmSetWindowAttribute\0".as_ptr());
             if !set_attr_proc.is_null() {
                 let set_attr: DwmSetWindowAttributeFn = std::mem::transmute(set_attr_proc);
@@ -413,66 +365,8 @@ fn configure_windows_window(hwnd: *mut std::ffi::c_void) {
         }
 
         let user32 = LoadLibraryA(b"user32.dll\0".as_ptr());
-        let gdi32 = LoadLibraryA(b"gdi32.dll\0".as_ptr());
 
         if !user32.is_null() {
-            let get_long_proc = {
-                let p = GetProcAddress(user32, b"GetWindowLongPtrW\0".as_ptr());
-                if !p.is_null() {
-                    p
-                } else {
-                    GetProcAddress(user32, b"GetWindowLongW\0".as_ptr())
-                }
-            };
-            let set_long_proc = {
-                let p = GetProcAddress(user32, b"SetWindowLongPtrW\0".as_ptr());
-                if !p.is_null() {
-                    p
-                } else {
-                    GetProcAddress(user32, b"SetWindowLongW\0".as_ptr())
-                }
-            };
-            let set_layered_proc =
-                GetProcAddress(user32, b"SetLayeredWindowAttributes\0".as_ptr());
-
-            const GWL_EXSTYLE: i32 = -20;
-            const WS_EX_LAYERED: isize = 0x00080000;
-            const LWA_ALPHA: u32 = 2;
-
-            if !get_long_proc.is_null() && !set_long_proc.is_null() {
-                let get_long: GetWindowLongPtrWFn = std::mem::transmute(get_long_proc);
-                let set_long: SetWindowLongPtrWFn = std::mem::transmute(set_long_proc);
-                let current_ex_style = get_long(hwnd, GWL_EXSTYLE);
-                let _ = set_long(hwnd, GWL_EXSTYLE, current_ex_style | WS_EX_LAYERED);
-            }
-
-            if !set_layered_proc.is_null() {
-                let set_layered: SetLayeredWindowAttributesFn =
-                    std::mem::transmute(set_layered_proc);
-                let _ = set_layered(hwnd, 0, 255, LWA_ALPHA);
-            }
-
-            if !gdi32.is_null() {
-                let stock_proc = GetProcAddress(gdi32, b"GetStockObject\0".as_ptr());
-                let set_class_proc = {
-                    let p = GetProcAddress(user32, b"SetClassLongPtrW\0".as_ptr());
-                    if !p.is_null() {
-                        p
-                    } else {
-                        GetProcAddress(user32, b"SetClassLongW\0".as_ptr())
-                    }
-                };
-
-                if !stock_proc.is_null() && !set_class_proc.is_null() {
-                    let get_stock_object: GetStockObjectFn = std::mem::transmute(stock_proc);
-                    let set_class_long: SetClassLongPtrWFn = std::mem::transmute(set_class_proc);
-                    const BLACK_BRUSH: i32 = 4;
-                    const GCLP_HBRBACKGROUND: i32 = -10;
-                    let black_brush = get_stock_object(BLACK_BRUSH);
-                    let _ = set_class_long(hwnd, GCLP_HBRBACKGROUND, black_brush as isize);
-                }
-            }
-
             let set_pos_proc = GetProcAddress(user32, b"SetWindowPos\0".as_ptr());
             if !set_pos_proc.is_null() {
                 let set_pos: SetWindowPosFn = std::mem::transmute(set_pos_proc);
@@ -495,6 +389,38 @@ fn configure_windows_window(hwnd: *mut std::ffi::c_void) {
     }
 }
 
+/// Clips the native window to a rounded rectangle (physical pixels).
+/// Guarantees no opaque/black corner pixels regardless of GPU/driver alpha support.
+#[cfg(windows)]
+fn set_windows_window_region(hwnd: *mut std::ffi::c_void, rect_px: [i32; 4], radius_px: i32) {
+    if hwnd.is_null() {
+        return;
+    }
+    extern "system" {
+        fn CreateRoundRectRgn(
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+            width: i32,
+            height: i32,
+        ) -> *mut std::ffi::c_void;
+        fn SetWindowRgn(
+            hwnd: *mut std::ffi::c_void,
+            h_rgn: *mut std::ffi::c_void,
+            b_redraw: i32,
+        ) -> i32;
+    }
+    let [l, t, r, b] = rect_px;
+    unsafe {
+        let region = CreateRoundRectRgn(l, t, r, b, radius_px * 2, radius_px * 2);
+        if !region.is_null() {
+            // The system owns `region` after a successful call.
+            let _ = SetWindowRgn(hwnd, region, 1);
+        }
+    }
+}
+
 pub struct IsleApp {
     cmd_tx: Sender<AudioCommand>,
     state_rx: Receiver<PlayerState>,
@@ -502,6 +428,10 @@ pub struct IsleApp {
     config: AppConfig,
     expanded: bool,
     current_viewport_is_expanded: bool,
+    #[cfg(windows)]
+    hwnd: Option<*mut std::ffi::c_void>,
+    #[cfg(windows)]
+    last_region: Option<([i32; 4], i32)>,
     search_query: String,
     last_window_pos: Option<Pos2>,
     muted_volume: Option<f32>,
@@ -525,9 +455,7 @@ impl IsleApp {
             .window_handle()
             .ok()
             .and_then(|handle| match handle.as_raw() {
-                RawWindowHandle::Win32(handle) => {
-                    Some(handle.hwnd.get() as *mut std::ffi::c_void)
-                }
+                RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as *mut std::ffi::c_void),
                 _ => None,
             });
         #[cfg(windows)]
@@ -545,6 +473,10 @@ impl IsleApp {
             config,
             expanded: false,
             current_viewport_is_expanded: false,
+            #[cfg(windows)]
+            hwnd,
+            #[cfg(windows)]
+            last_region: None,
             search_query: String::new(),
             last_window_pos: None,
             muted_volume: None,
@@ -1186,48 +1118,107 @@ impl eframe::App for IsleApp {
         }
 
         let anim_id = egui::Id::new("isle_expansion_anim");
-        let raw_t = ctx.animate_bool_with_time(anim_id, self.expanded, 0.16);
+        let raw_t = ctx.animate_bool_with_time(anim_id, self.expanded, 0.22);
+        let t = expand_progress(raw_t);
 
         if !self.expanded && self.current_viewport_is_expanded && raw_t <= 0.001 {
             self.resize(ctx, false);
             self.current_viewport_is_expanded = false;
         }
 
+        let (current_size, rounding) = island_dimensions(raw_t);
+        let origin = pos2(1.0, 1.0);
+        let island_rect = Rect::from_min_size(origin, current_size - vec2(2.0, 2.0));
+
+        #[cfg(windows)]
+        if let Some(hwnd) = self.hwnd {
+            let ppp = ctx.pixels_per_point();
+            let outer = island_rect.expand(0.6);
+            let region = (
+                [
+                    (outer.left() * ppp).round() as i32,
+                    (outer.top() * ppp).round() as i32,
+                    (outer.right() * ppp).round() as i32,
+                    (outer.bottom() * ppp).round() as i32,
+                ],
+                ((rounding + 0.6) * ppp).round() as i32,
+            );
+            if self.last_region != Some(region) {
+                set_windows_window_region(hwnd, region.0, region.1);
+                self.last_region = Some(region);
+            }
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
-                let (current_size, rounding) = island_dimensions(raw_t);
-                let origin = ui.max_rect().min + vec2(1.0, 1.0);
-                let island_rect = Rect::from_min_size(origin, current_size - vec2(2.0, 2.0));
-
                 ui.painter().rect(
                     island_rect,
                     Rounding::same(rounding),
                     ISLAND_BG,
                     Stroke::new(1.2_f32, ISLAND_BORDER),
                 );
+            });
 
-                if raw_t <= 0.05 {
-                    let pill_content_rect = Rect::from_min_size(
-                        island_rect.min,
-                        vec2(PILL_WIDTH - 2.0, PILL_HEIGHT - 2.0),
-                    );
+        // Zoom transition: the pill zooms in and fades out while the dashboard zooms in from
+        // slightly smaller; collapsing plays the same thing in reverse.
+        let island_center = island_rect.center();
+        let zoom_transform = |layout_center: Pos2, scale: f32| {
+            if (scale - 1.0).abs() < 1e-4 {
+                egui::emath::TSTransform::IDENTITY
+            } else {
+                egui::emath::TSTransform::new(
+                    island_center.to_vec2() - layout_center.to_vec2() * scale,
+                    scale,
+                )
+            }
+        };
+
+        let pill_id = egui::Id::new("isle_pill_area");
+        let dash_id = egui::Id::new("isle_dashboard_area");
+        let pill_layer = egui::LayerId::new(egui::Order::Middle, pill_id);
+        let dash_layer = egui::LayerId::new(egui::Order::Middle, dash_id);
+
+        if t < 0.5 {
+            let k = t * 2.0;
+            let pill_rect = Rect::from_min_size(origin, vec2(PILL_WIDTH - 2.0, PILL_HEIGHT - 2.0));
+            let transform = zoom_transform(pill_rect.center(), 1.0 + ZOOM_AMOUNT * k);
+            ctx.set_transform_layer(pill_layer, transform);
+            let clip = transform.inverse() * island_rect;
+            egui::Area::new(pill_id)
+                .order(egui::Order::Middle)
+                .fixed_pos(Pos2::ZERO)
+                .constrain(false)
+                .show(ctx, |ui| {
+                    ui.set_clip_rect(clip);
+                    ui.set_opacity(1.0 - k);
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(pill_rect), |ui| {
+                        self.collapsed(ui, ctx);
+                    });
+                });
+        }
+        if t > 0.3 {
+            let k = ((t - 0.3) / 0.7).clamp(0.0, 1.0);
+            let final_rect =
+                Rect::from_min_size(origin, vec2(EXPANDED_WIDTH - 2.0, EXPANDED_HEIGHT - 2.0));
+            let transform = zoom_transform(final_rect.center(), 1.0 - ZOOM_AMOUNT * (1.0 - k));
+            ctx.set_transform_layer(dash_layer, transform);
+            let clip = transform.inverse() * island_rect;
+            egui::Area::new(dash_id)
+                .order(egui::Order::Middle)
+                .fixed_pos(Pos2::ZERO)
+                .constrain(false)
+                .show(ctx, |ui| {
+                    ui.set_clip_rect(clip);
+                    ui.set_opacity(k);
                     ui.allocate_new_ui(
-                        egui::UiBuilder::new().max_rect(pill_content_rect),
+                        egui::UiBuilder::new().max_rect(final_rect.shrink(16.0)),
                         |ui| {
-                            self.collapsed(ui, ctx);
+                            self.expanded(ui, ctx);
                         },
                     );
-                } else {
-                    let content_rect = island_rect.shrink(16.0);
-                    let opacity = (raw_t * 1.2).clamp(0.0, 1.0);
-                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(content_rect), |ui| {
-                        ui.set_clip_rect(island_rect);
-                        ui.set_opacity(opacity);
-                        self.expanded(ui, ctx);
-                    });
-                }
-            });
+                });
+        }
         self.save_config_if_dirty();
     }
 
