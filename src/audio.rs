@@ -2,8 +2,9 @@
 use crate::media_keys::MediaKeyManager;
 use crate::{
     extractor::{
-        canonical_title, fetch_related_tracks, is_ytdlp_available, resolve_input,
-        resolve_stream_info, ExtractorError,
+        canonical_title, fetch_related_tracks, is_blocked_host, is_ytdlp_available,
+        private_aware_redirect_policy, resolve_input, resolve_stream_info, ExtractorError,
+        StreamInfo,
     },
     models::{AppConfig, AudioCommand, PlayerState, TrackItem},
 };
@@ -137,6 +138,7 @@ fn build_http_client(
         .connect_timeout(connect_timeout)
         .tcp_keepalive(Duration::from_secs(15))
         .timeout(io_timeout)
+        .redirect(private_aware_redirect_policy())
         .build()
         .ok()
 }
@@ -157,6 +159,8 @@ enum HttpRangeOpenError {
     Request(#[from] reqwest::Error),
     #[error("invalid HTTP byte range response")]
     InvalidRange,
+    #[error("stream host resolves to a private address")]
+    PrivateHost,
 }
 
 impl HttpRangeOpenError {
@@ -164,8 +168,19 @@ impl HttpRangeOpenError {
         match self {
             Self::Request(error) => Self::Request(error.without_url()),
             Self::InvalidRange => Self::InvalidRange,
+            Self::PrivateHost => Self::PrivateHost,
         }
     }
+}
+
+fn open_stream_reader(
+    client: &reqwest::blocking::Client,
+    info: StreamInfo,
+) -> Result<HttpRangeReader, HttpRangeOpenError> {
+    if is_blocked_host(&info.url) {
+        return Err(HttpRangeOpenError::PrivateHost);
+    }
+    HttpRangeReader::open(client, info.url, info.user_agent)
 }
 
 #[derive(Clone, Copy)]
@@ -448,7 +463,7 @@ fn prepare_track(
         }
     };
     let mut detected_browser = stream_info.browser_used.clone();
-    let mut reader = match HttpRangeReader::open(client, stream_info.url, stream_info.user_agent) {
+    let mut reader = match open_stream_reader(client, stream_info) {
         Ok(reader) => Some(reader),
         Err(err) => {
             eprintln!(
@@ -464,7 +479,7 @@ fn prepare_track(
         match resolve_stream_info(&fallback, cookies_browser) {
             Ok(info) => {
                 detected_browser = info.browser_used.clone();
-                reader = match HttpRangeReader::open(client, info.url, info.user_agent) {
+                reader = match open_stream_reader(client, info) {
                     Ok(reader) => Some(reader),
                     Err(err) => {
                         eprintln!(
@@ -1801,5 +1816,69 @@ mod tests {
         assert!((state.volume - 1.5).abs() < f32::EPSILON);
         apply_volume(&mut state, -1.0);
         assert!(state.volume.abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn refuses_a_redirect_to_a_private_address() {
+        // Given: a reachable loopback target that the redirect would lead to.
+        let target = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_url = format!("http://{}", target.local_addr().unwrap());
+        let target_hits = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            loop {
+                match target.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let response =
+                            "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                        let _ = stream.write_all(response.as_bytes());
+                        return true;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        thread::yield_now();
+                    }
+                    Err(error) => panic!("target accept failed: {error}"),
+                }
+            }
+        });
+
+        // And: a server that redirects to that target.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let redirect = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let _ = read_range_header(&mut stream);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target_url}/\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(1))
+            .redirect(private_aware_redirect_policy())
+            .build()
+            .unwrap();
+
+        // When: the client follows that redirect.
+        let result = client.get(format!("{url}/start")).send();
+
+        // Then: the hop is refused and the private target is never contacted.
+        assert!(
+            result.is_err(),
+            "a redirect to a private address must be refused"
+        );
+        redirect.join().unwrap();
+        assert!(
+            !target_hits.join().unwrap(),
+            "the private target must not be reached"
+        );
     }
 }

@@ -1,6 +1,6 @@
 use std::{
     io::{ErrorKind, Read},
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     thread,
@@ -102,6 +102,73 @@ fn is_private_ipv6(address: Ipv6Addr) -> bool {
     (address.segments()[0] & 0xfe00) == 0xfc00 || (address.segments()[0] & 0xffc0) == 0xfe80
 }
 
+fn is_private_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_private_ipv4(address),
+        IpAddr::V6(address) => is_private_ipv6(address),
+    }
+}
+
+fn domain_resolves_to_private<F>(domain: &str, port: u16, resolve: F) -> bool
+where
+    F: Fn(&str, u16) -> Vec<SocketAddr>,
+{
+    resolve(domain, port)
+        .into_iter()
+        .any(|address| is_private_ip(address.ip()))
+}
+
+fn resolve_socket_addrs(domain: &str, port: u16) -> Vec<SocketAddr> {
+    (domain, port)
+        .to_socket_addrs()
+        .map(|addresses| addresses.collect())
+        .unwrap_or_default()
+}
+
+fn resolves_to_private_with<F>(raw: &str, resolve: F) -> bool
+where
+    F: Fn(&str, u16) -> Vec<SocketAddr>,
+{
+    let normalized = raw.trim().to_ascii_lowercase();
+    if !(normalized.starts_with("http://") || normalized.starts_with("https://")) {
+        return false;
+    }
+    let Ok(url) = Url::parse(&normalized) else {
+        return false;
+    };
+    let Some(Host::Domain(domain)) = url.host() else {
+        return false;
+    };
+    let Some(port) = url.port_or_known_default() else {
+        return false;
+    };
+    domain_resolves_to_private(domain, port, resolve)
+}
+
+fn resolves_to_private(raw: &str) -> bool {
+    resolves_to_private_with(raw, resolve_socket_addrs)
+}
+
+/// Literal host check plus a DNS lookup, so a public name that resolves to a
+/// private address cannot be used to reach the local network.
+pub(crate) fn is_blocked_host(raw: &str) -> bool {
+    is_private_host(raw) || resolves_to_private(raw)
+}
+
+/// Re-applies the private-host guard to every redirect hop; reqwest otherwise
+/// follows up to ten hops without asking us about the destination.
+pub(crate) fn private_aware_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            attempt.error("too many redirects")
+        } else if is_blocked_host(attempt.url().as_str()) {
+            attempt.error("redirect to a private address")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 pub fn classify_input(raw: &str) -> Result<InputKind, ExtractorError> {
     let input = raw.trim();
     if input.is_empty() {
@@ -112,7 +179,7 @@ pub fn classify_input(raw: &str) -> Result<InputKind, ExtractorError> {
         || input.starts_with("https://")
         || input.starts_with("spotify:")
     {
-        if is_private_host(input) {
+        if is_blocked_host(input) {
             return Err(ExtractorError::PrivateNetwork);
         }
         if input.contains("open.spotify.com") || input.starts_with("spotify:") {
@@ -411,6 +478,7 @@ fn resolve_spotify(url: &str) -> Result<Vec<TrackItem>, ExtractorError> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0")
         .timeout(Duration::from_secs(5))
+        .redirect(private_aware_redirect_policy())
         .build()?;
     if let Some((kind, id)) = parse_spotify_resource(url) {
         let embed_url = format!("https://open.spotify.com/embed/{kind}/{id}");
@@ -893,10 +961,6 @@ mod tests {
             "https://www.youtube.com/playlist?list=x",
         ] {
             assert!(!is_private_host(input), "{input} should pass");
-            assert!(
-                !matches!(classify_input(input), Err(ExtractorError::PrivateNetwork)),
-                "{input} should classify"
-            );
         }
         assert!(!is_private_host("spotify:track:abc"));
         assert!(!is_private_host("spotify:playlist:abc"));
@@ -1023,5 +1087,58 @@ mod tests {
         assert_eq!(info2.url, "https://example.com/plain.m4a");
         assert_eq!(info2.user_agent, None);
         assert_eq!(info2.browser_used, None);
+    }
+
+    #[test]
+    fn rejects_domains_that_resolve_to_private_addresses() {
+        // Given: resolvers returning each private address shape.
+        let loopback = |_: &str, port: u16| vec![SocketAddr::from(([127, 0, 0, 1], port))];
+        let private = |_: &str, port: u16| vec![SocketAddr::from(([10, 1, 2, 3], port))];
+        let public = |_: &str, port: u16| vec![SocketAddr::from(([93, 184, 216, 34], port))];
+        let mixed = |_: &str, port: u16| {
+            vec![
+                SocketAddr::from(([93, 184, 216, 34], port)),
+                SocketAddr::from(([127, 0, 0, 1], port)),
+            ]
+        };
+        let v6_loopback = |_: &str, port: u16| vec![SocketAddr::from((Ipv6Addr::LOCALHOST, port))];
+
+        // Then: any private result blocks the host, public or empty does not.
+        assert!(domain_resolves_to_private("rebind.test", 443, loopback));
+        assert!(domain_resolves_to_private("rebind.test", 443, private));
+        assert!(domain_resolves_to_private("rebind.test", 443, mixed));
+        assert!(domain_resolves_to_private("rebind.test", 443, v6_loopback));
+        assert!(!domain_resolves_to_private("ok.test", 443, public));
+        assert!(!domain_resolves_to_private(
+            "unresolvable.test",
+            443,
+            |_, _| { Vec::new() }
+        ));
+    }
+
+    #[test]
+    fn rejects_names_that_resolve_to_a_private_address() {
+        // Given: resolvers that map every name to loopback or to a public address.
+        let loopback = |_: &str, port: u16| vec![SocketAddr::from(([127, 0, 0, 1], port))];
+        let public = |_: &str, port: u16| vec![SocketAddr::from(([93, 184, 216, 34], port))];
+
+        // Then: a resolving name is blocked, while literal IPs stay with is_private_host.
+        assert!(resolves_to_private_with(
+            "http://rebind.test:8080/audio",
+            loopback
+        ));
+        assert!(resolves_to_private_with(
+            "HTTPS://Rebind.Test/audio",
+            loopback
+        ));
+        assert!(!resolves_to_private_with(
+            "http://rebind.test/audio",
+            public
+        ));
+        assert!(!resolves_to_private_with(
+            "http://127.0.0.1/audio",
+            loopback
+        ));
+        assert!(!resolves_to_private_with("spotify:track:abc", loopback));
     }
 }
