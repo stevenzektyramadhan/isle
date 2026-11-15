@@ -50,13 +50,21 @@ jobs:
         run: |
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.*)"').Matches[0].Groups[1].Value
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$version" "installer\isle.iss"
-      - name: Write update manifest
+      - name: Write and sign the update manifest
         shell: pwsh
+        env:
+          ISLE_UPDATE_SIGNING_KEY: ${{ secrets.ISLE_UPDATE_SIGNING_KEY }}
         run: |
+          if (-not $env:ISLE_UPDATE_SIGNING_KEY) {
+            throw "ISLE_UPDATE_SIGNING_KEY is not set; refusing to publish an unsigned update"
+          }
           $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.*)"').Matches[0].Groups[1].Value
           $sha = (Get-FileHash dist/Isle-Setup-x64.exe -Algorithm SHA256).Hash.ToLower()
           $json = @{ version = $version; sha256 = $sha } | ConvertTo-Json -Compress
           [System.IO.File]::WriteAllText("$PWD/dist/latest.json", $json)
+          $signature = cargo run --locked --quiet --example sign_manifest -- dist/latest.json
+          if ($LASTEXITCODE -ne 0 -or -not $signature) { throw "manifest signing failed" }
+          [System.IO.File]::WriteAllText("$PWD/dist/latest.json.sig", $signature)
       - name: Assemble portable bundle
         shell: pwsh
         run: |
@@ -77,6 +85,7 @@ jobs:
           path: |
             dist/Isle-Setup-x64.exe
             dist/latest.json
+            dist/latest.json.sig
           if-no-files-found: error
 
   linux:
