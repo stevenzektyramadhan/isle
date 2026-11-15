@@ -71,11 +71,13 @@ Unduh `Isle-Setup-x64.exe` dari halaman release, jalankan, lalu ikuti wizard. In
 
 ### Update Otomatis (khusus versi terpasang)
 
-Isle yang dipasang lewat installer mengecek rilis terbaru maksimal sekali sehari. Saat ada versi baru, badge `UPDATE x.y.z` muncul di dashboard (dan baris status pill menampilkan versi yang tersedia). Klik badge tersebut untuk mengunduh installer baru, memverifikasi SHA-256 dari `latest.json`, lalu memasangnya secara silent; Isle menutup dan terbuka lagi otomatis di versi baru. Config di `%APPDATA%\isle\config.json` tidak berubah.
+Isle yang dipasang lewat installer mengecek rilis terbaru maksimal sekali sehari. Saat ada versi baru, badge `UPDATE x.y.z` muncul di dashboard (dan baris status pill menampilkan versi yang tersedia). Klik badge tersebut untuk mengunduh installer baru, memverifikasi tanda tangan Ed25519 `latest.json` dengan public key yang tertanam di binary, mencocokkan SHA-256 installer, lalu memasangnya secara silent; Isle menutup dan terbuka lagi otomatis di versi baru. Config di `%APPDATA%\isle\config.json` tidak berubah.
 
 Jika unduhan atau verifikasi gagal, pesan kesalahan tampil di baris status dan badge bisa diklik lagi. Bundle portabel tidak memakai update otomatis; pengguna portabel tetap memperbarui secara manual.
 
-Saat merilis versi baru, naikkan `version` di `Cargo.toml`, lalu push tag `vX.Y.Z`. Workflow Release membangun installer, menulis `latest.json` berisi versi dan SHA-256 installer, dan mengunggah keduanya ke release; itulah yang dibaca fitur update otomatis.
+Saat merilis versi baru, naikkan `version` di `Cargo.toml`, lalu push tag `vX.Y.Z`. Workflow Release membangun installer, menulis `latest.json` berisi versi dan SHA-256 installer, menandatanganinya menjadi `latest.json.sig`, lalu mengunggah ketiganya ke release; itulah yang dibaca fitur update otomatis. Rilis ditolak jika secret `ISLE_UPDATE_SIGNING_KEY` tidak diset.
+
+Kunci tanda tangan dibuat sekali dengan `cargo run --example sign_manifest -- --generate <path>`. File yang dihasilkan berisi private key: simpan isinya sebagai secret `ISLE_UPDATE_SIGNING_KEY`, lalu hapus file lokalnya. Public key yang dicetak di-embed sebagai `UPDATE_PUBLIC_KEY_HEX` di `src/updater.rs`. Arsipkan private key itu dengan aman — kalau hilang, instalasi yang sudah beredar tidak bisa menerima update otomatis lagi, karena public key lama sudah tertanam di binary mereka.
 
 ### Bundle Portabel Windows
 

@@ -8,7 +8,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 #[cfg(windows)]
 use crate::media_keys::MediaKeyManager;
 use crate::models::{AppConfig, AudioCommand, PlayerState};
-use crate::updater::UpdateManifest;
+use crate::updater::VerifiedUpdate;
 
 pub const PILL_WIDTH: f32 = 290.0;
 pub const PILL_HEIGHT: f32 = 54.0;
@@ -500,8 +500,8 @@ pub struct IsleApp {
     muted_volume: Option<f32>,
     config_dirty: bool,
     last_config_save: Instant,
-    update_rx: Receiver<UpdateManifest>,
-    pending_update: Option<UpdateManifest>,
+    update_rx: Receiver<VerifiedUpdate>,
+    pending_update: Option<VerifiedUpdate>,
     install_rx: Option<Receiver<Result<(), String>>>,
     update_note: Option<String>,
     installing: bool,
