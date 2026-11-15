@@ -6,14 +6,56 @@ use serde::Deserialize;
 
 const MANIFEST_URL: &str =
     "https://github.com/stevenzektyramadhan/isle/releases/latest/download/latest.json";
+const MANIFEST_SIGNATURE_URL: &str =
+    "https://github.com/stevenzektyramadhan/isle/releases/latest/download/latest.json.sig";
 const INSTALLER_URL: &str =
     "https://github.com/stevenzektyramadhan/isle/releases/latest/download/Isle-Setup-x64.exe";
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+const UPDATE_PUBLIC_KEY_HEX: &str =
+    "572f8ffdacc79e09f5e57ae04b6b0fd18ad42c2d2936b5bd63bd6f91f3e52e46";
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct UpdateManifest {
     pub version: String,
     pub sha256: String,
+}
+
+/// A manifest whose detached signature verified against the embedded public
+/// key. Only [`VerifiedUpdate::verify`] can build one, so the installer path
+/// cannot be reached with a manifest that an attacker who controls the release
+/// host forged.
+#[derive(Clone, Debug)]
+pub struct VerifiedUpdate {
+    manifest: UpdateManifest,
+}
+
+impl std::ops::Deref for VerifiedUpdate {
+    type Target = UpdateManifest;
+
+    fn deref(&self) -> &Self::Target {
+        &self.manifest
+    }
+}
+
+impl VerifiedUpdate {
+    fn verify(signed_bytes: Vec<u8>, signature: Vec<u8>) -> Result<Self, UpdateError> {
+        let public_key = update_public_key().ok_or(UpdateError::BadSignature)?;
+        Self::verify_with(signed_bytes, signature, &public_key)
+    }
+
+    fn verify_with(
+        signed_bytes: Vec<u8>,
+        signature: Vec<u8>,
+        public_key: &[u8],
+    ) -> Result<Self, UpdateError> {
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
+            .verify(&signed_bytes, &signature)
+            .map_err(|_| UpdateError::BadSignature)?;
+        Ok(Self {
+            manifest: serde_json::from_slice(&signed_bytes)?,
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +66,8 @@ pub enum UpdateError {
     Json(#[from] serde_json::Error),
     #[error("update file I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("update manifest failed its signature check")]
+    BadSignature,
     #[error("downloaded update failed its checksum")]
     ChecksumMismatch,
     #[error("update installer could not start: {0}")]
@@ -49,22 +93,30 @@ fn installed_marker_exists(directory: &Path) -> bool {
     directory.join("unins000.exe").is_file()
 }
 
-pub fn check_for_update(current_version: &str) -> Result<Option<UpdateManifest>, UpdateError> {
+pub fn check_for_update(current_version: &str) -> Result<Option<VerifiedUpdate>, UpdateError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .user_agent("isle-updater")
         .build()?;
-    let manifest: UpdateManifest = serde_json::from_str(
+    let signed_bytes = client
+        .get(MANIFEST_URL)
+        .send()?
+        .error_for_status()?
+        .bytes()?
+        .to_vec();
+    let signature = decode_hex(
         &client
-            .get(MANIFEST_URL)
+            .get(MANIFEST_SIGNATURE_URL)
             .send()?
             .error_for_status()?
             .text()?,
-    )?;
-    Ok(is_newer_version(&manifest.version, current_version).then_some(manifest))
+    )
+    .ok_or(UpdateError::BadSignature)?;
+    let update = VerifiedUpdate::verify(signed_bytes, signature)?;
+    Ok(is_newer_version(&update.version, current_version).then_some(update))
 }
 
-pub fn download_and_install(manifest: &UpdateManifest) -> Result<(), UpdateError> {
+pub fn download_and_install(update: &VerifiedUpdate) -> Result<(), UpdateError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(180))
         .user_agent("isle-updater")
@@ -72,7 +124,7 @@ pub fn download_and_install(manifest: &UpdateManifest) -> Result<(), UpdateError
     let mut response = client.get(INSTALLER_URL).send()?.error_for_status()?;
     let mut bytes = Vec::new();
     response.read_to_end(&mut bytes)?;
-    if !sha256_hex(&bytes).eq_ignore_ascii_case(&manifest.sha256) {
+    if !sha256_hex(&bytes).eq_ignore_ascii_case(&update.sha256) {
         return Err(UpdateError::ChecksumMismatch);
     }
     let directory = std::env::temp_dir().join("isle-update");
@@ -108,6 +160,21 @@ fn parse_version(version: &str) -> (u64, u64, u64) {
     )
 }
 
+fn update_public_key() -> Option<[u8; ring::signature::ED25519_PUBLIC_KEY_LEN]> {
+    decode_hex(UPDATE_PUBLIC_KEY_HEX)?.try_into().ok()
+}
+
+fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    let text = text.trim();
+    if !text.is_ascii() || !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).ok())
+        .collect()
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
@@ -123,6 +190,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_signer() -> (ring::signature::Ed25519KeyPair, Vec<u8>) {
+        use ring::signature::KeyPair as _;
+
+        let document =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .expect("test key pair should be generated");
+        let key_pair = ring::signature::Ed25519KeyPair::from_pkcs8(document.as_ref())
+            .expect("test key pair should load");
+        let public_key = key_pair.public_key().as_ref().to_vec();
+        (key_pair, public_key)
+    }
+
+    fn sign(bytes: &[u8], key_pair: &ring::signature::Ed25519KeyPair) -> Vec<u8> {
+        key_pair.sign(bytes).as_ref().to_vec()
+    }
 
     #[test]
     fn compares_versions_numerically() {
@@ -161,5 +244,97 @@ mod tests {
         assert!(installed_marker_exists(&directory));
 
         std::fs::remove_dir_all(&directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn accepts_a_manifest_signed_by_its_key() {
+        // Given: a manifest and the key that signs it.
+        let (key_pair, public_key) = test_signer();
+        let bytes = br#"{"version":"0.1.3","sha256":"ab"}"#.to_vec();
+
+        // When: the detached signature is checked.
+        let update =
+            VerifiedUpdate::verify_with(bytes.clone(), sign(&bytes, &key_pair), &public_key)
+                .expect("signature should verify");
+
+        // Then: the parsed manifest is available behind the verified wrapper.
+        assert_eq!(update.version, "0.1.3");
+        assert_eq!(update.sha256, "ab");
+    }
+
+    #[test]
+    fn rejects_a_manifest_whose_bytes_changed_after_signing() {
+        // Given: a signed manifest and a version of it with a different hash.
+        let (key_pair, public_key) = test_signer();
+        let signed_bytes = br#"{"version":"0.1.3","sha256":"ab"}"#.to_vec();
+        let signature = sign(&signed_bytes, &key_pair);
+        let tampered = br#"{"version":"0.1.3","sha256":"cd"}"#.to_vec();
+
+        // Then: swapping the installer hash invalidates the signature.
+        assert!(matches!(
+            VerifiedUpdate::verify_with(tampered, signature, &public_key),
+            Err(UpdateError::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_signature_from_a_different_key() {
+        // Given: a manifest signed by one key but checked against another.
+        let (signing_key, _) = test_signer();
+        let (_, other_public_key) = test_signer();
+        let bytes = br#"{"version":"0.1.3","sha256":"ab"}"#.to_vec();
+
+        // Then: a forged release cannot pass with its own key.
+        assert!(matches!(
+            VerifiedUpdate::verify_with(
+                bytes.clone(),
+                sign(&bytes, &signing_key),
+                &other_public_key
+            ),
+            Err(UpdateError::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_malformed_signature() {
+        // Given: a well-formed manifest with truncated or oversized signatures.
+        let (_, public_key) = test_signer();
+        let bytes = br#"{"version":"0.1.3","sha256":"ab"}"#.to_vec();
+
+        // Then: every wrong length is refused rather than trusted.
+        for signature in [vec![], vec![0u8; 63], vec![0u8; 65]] {
+            assert!(matches!(
+                VerifiedUpdate::verify_with(bytes.clone(), signature, &public_key),
+                Err(UpdateError::BadSignature)
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_a_signed_manifest_that_is_not_json() {
+        // Given: bytes that are correctly signed but are not a manifest.
+        let (key_pair, public_key) = test_signer();
+        let bytes = b"not a manifest".to_vec();
+
+        // Then: verification succeeds on the signature but parsing still fails.
+        assert!(matches!(
+            VerifiedUpdate::verify_with(bytes.clone(), sign(&bytes, &key_pair), &public_key),
+            Err(UpdateError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn embeds_a_well_formed_public_key() {
+        let public_key = update_public_key().expect("embedded public key should parse");
+        assert_ne!(public_key, [0u8; ring::signature::ED25519_PUBLIC_KEY_LEN]);
+    }
+
+    #[test]
+    fn decodes_hex_and_rejects_garbage() {
+        assert_eq!(decode_hex("00ff10"), Some(vec![0x00, 0xff, 0x10]));
+        assert_eq!(decode_hex("  ABcd \n"), Some(vec![0xab, 0xcd]));
+        assert_eq!(decode_hex("abc"), None);
+        assert_eq!(decode_hex("zz"), None);
+        assert_eq!(decode_hex("éé"), None);
     }
 }

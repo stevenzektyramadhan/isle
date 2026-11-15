@@ -1919,6 +1919,7 @@ dependencies = [
  "egui",
  "raw-window-handle",
  "reqwest",
+ "ring",
  "rodio",
  "serde",
  "serde_json",
