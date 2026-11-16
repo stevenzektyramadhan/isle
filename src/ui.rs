@@ -63,6 +63,13 @@ pub fn transport_labels(autoplay: bool, queue_len: usize) -> (&'static str, Stri
         },
     )
 }
+pub fn update_action_hint(version: &str, self_install: bool) -> String {
+    if self_install {
+        format!("Install Isle {version}")
+    } else {
+        format!("Open the release page for Isle {version}")
+    }
+}
 pub fn truncate_title(title: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -536,7 +543,7 @@ impl IsleApp {
         media_keys.sync_state(&PlayerState::default());
         let now = unix_now_secs();
         let update_check_started = !cfg!(debug_assertions)
-            && crate::updater::is_installed()
+            && crate::updater::should_check_for_updates()
             && crate::updater::check_due(config.last_update_check_secs, now);
         let (update_tx, update_rx) = mpsc::channel();
         if update_check_started {
@@ -600,6 +607,18 @@ impl IsleApp {
         let Some(update) = self.pending_update.clone() else {
             return;
         };
+        if !crate::updater::self_install_supported() {
+            // No in-place installer on this platform: send the user to the
+            // release page so they download the newer build themselves.
+            match crate::updater::open_release_page() {
+                Ok(()) => {
+                    self.pending_update = None;
+                    self.update_note = None;
+                }
+                Err(error) => self.update_note = Some(error.to_string()),
+            }
+            return;
+        }
         let (install_tx, install_rx) = mpsc::channel();
         self.install_rx = Some(install_rx);
         self.installing = true;
@@ -852,10 +871,12 @@ impl IsleApp {
                     } else {
                         format!("UPDATE {}", update.version)
                     };
-                    let hint = self
-                        .update_note
-                        .clone()
-                        .unwrap_or_else(|| format!("Install Isle {}", update.version));
+                    let hint = self.update_note.clone().unwrap_or_else(|| {
+                        update_action_hint(
+                            &update.version,
+                            crate::updater::self_install_supported(),
+                        )
+                    });
                     let response = update_badge(ui, &label).on_hover_text(hint);
                     if response.clicked() && !self.installing {
                         self.start_update();
@@ -1448,6 +1469,14 @@ mod tests {
             ("AUTO ON", "CLR (12)".to_owned())
         );
         assert_eq!(transport_labels(false, 0), ("AUTO OFF", "CLEAR".to_owned()));
+    }
+    #[test]
+    fn describes_the_update_action_per_install_kind() {
+        assert_eq!(update_action_hint("0.1.4", true), "Install Isle 0.1.4");
+        assert_eq!(
+            update_action_hint("0.1.4", false),
+            "Open the release page for Isle 0.1.4"
+        );
     }
     #[test]
     fn calculates_expansion_progress_and_dimensions() {
