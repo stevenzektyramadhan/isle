@@ -10,6 +10,7 @@ const MANIFEST_SIGNATURE_URL: &str =
     "https://github.com/stevenzektyramadhan/isle/releases/latest/download/latest.json.sig";
 const INSTALLER_URL: &str =
     "https://github.com/stevenzektyramadhan/isle/releases/latest/download/Isle-Setup-x64.exe";
+const RELEASES_PAGE_URL: &str = "https://github.com/stevenzektyramadhan/isle/releases/latest";
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
 const UPDATE_PUBLIC_KEY_HEX: &str =
@@ -72,6 +73,8 @@ pub enum UpdateError {
     ChecksumMismatch,
     #[error("update installer could not start: {0}")]
     Spawn(std::io::Error),
+    #[error("could not open the release page: {0}")]
+    OpenReleasePage(std::io::Error),
 }
 
 pub fn check_due(last_check_secs: Option<u64>, now_secs: u64) -> bool {
@@ -91,6 +94,43 @@ pub fn is_installed() -> bool {
 
 fn installed_marker_exists(directory: &Path) -> bool {
     directory.join("unins000.exe").is_file()
+}
+
+/// Whether the running build can replace itself in place. Only the Windows
+/// installer layout ships an uninstaller next to the binary, so every other
+/// layout (the Linux tarball, the portable Windows ZIP) has no self-install path.
+#[cfg(windows)]
+pub fn self_install_supported() -> bool {
+    is_installed()
+}
+
+#[cfg(not(windows))]
+pub fn self_install_supported() -> bool {
+    false
+}
+
+/// Released builds look for a newer version at most once a day. A self-installing
+/// build applies it; a Linux tarball can only be pointed at the release page, so
+/// it checks too instead of silently freezing on the version it was downloaded at.
+pub fn should_check_for_updates() -> bool {
+    self_install_supported() || cfg!(target_os = "linux")
+}
+
+/// Opens the release page so the user can download the newer build themselves.
+/// Used where there is no self-install path.
+pub fn open_release_page() -> Result<(), UpdateError> {
+    let opener = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(RELEASES_PAGE_URL)
+        .spawn()
+        .map(|_| ())
+        .map_err(UpdateError::OpenReleasePage)
 }
 
 pub fn check_for_update(current_version: &str) -> Result<Option<VerifiedUpdate>, UpdateError> {
@@ -222,6 +262,15 @@ mod tests {
         assert!(!check_due(Some(1_000), 1_000 + 86_399));
         assert!(check_due(Some(1_000), 1_000 + 86_400));
         assert!(check_due(Some(5_000), 1_000));
+    }
+
+    /// The Linux tarball ships no uninstaller marker, so gating the check on
+    /// "is installed" would freeze it on the downloaded version forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checks_for_updates_where_the_bundle_cannot_self_install() {
+        assert!(!self_install_supported());
+        assert!(should_check_for_updates());
     }
 
     #[test]
