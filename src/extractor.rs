@@ -296,6 +296,30 @@ fn is_usable_stream_url(url: &str) -> bool {
     !url.contains("c=TVHTML5")
 }
 
+fn timed_stream_attempt(
+    flags: &[&str],
+    target: &str,
+    stage: &'static str,
+) -> Result<String, ExtractorError> {
+    let started = Instant::now();
+    let result = run_ytdlp(flags, target);
+    let outcome = match &result {
+        Err(_) => "error",
+        Ok(output) => match parse_stream_json(output) {
+            None => "no_stream",
+            Some(info) if stage != "final_fallback" && !is_usable_stream_url(&info.url) => {
+                "unusable_stream"
+            }
+            Some(_) => "success",
+        },
+    };
+    eprintln!(
+        "[isle] extractor stream stage={stage} outcome={outcome} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    result
+}
+
 pub fn resolve_stream_info(
     original_url: &str,
     cookies_browser: Option<&str>,
@@ -303,7 +327,7 @@ pub fn resolve_stream_info(
     let mut last_error = None;
 
     let flags = primary_stream_flags();
-    match run_ytdlp(&flags, original_url) {
+    match timed_stream_attempt(&flags, original_url, "primary") {
         Ok(output) => {
             if let Some(info) = parse_stream_json(&output) {
                 if is_usable_stream_url(&info.url) {
@@ -323,7 +347,7 @@ pub fn resolve_stream_info(
             "--cookies-from-browser",
             browser,
         ];
-        match run_ytdlp(&flags, original_url) {
+        match timed_stream_attempt(&flags, original_url, "configured_browser") {
             Ok(output) => {
                 if let Some(mut info) = parse_stream_json(&output) {
                     if is_usable_stream_url(&info.url) {
@@ -348,7 +372,7 @@ pub fn resolve_stream_info(
             "--cookies-from-browser",
             candidate,
         ];
-        match run_ytdlp(&flags, original_url) {
+        match timed_stream_attempt(&flags, original_url, "browser_candidate") {
             Ok(output) => {
                 if let Some(mut info) = parse_stream_json(&output) {
                     if is_usable_stream_url(&info.url) {
@@ -380,7 +404,7 @@ pub fn resolve_stream_info(
         STREAM_FORMAT,
         "--no-playlist",
     ];
-    if let Ok(output) = run_ytdlp(&fallback_flags, original_url) {
+    if let Ok(output) = timed_stream_attempt(&fallback_flags, original_url, "final_fallback") {
         if let Some(info) = parse_stream_json(&output) {
             return Ok(info);
         }
@@ -451,7 +475,8 @@ pub fn fetch_related_tracks(last_track: &TrackItem) -> Result<Vec<TrackItem>, Ex
 }
 
 fn resolve_search(query: &str) -> Result<Vec<TrackItem>, ExtractorError> {
-    run_ytdlp(
+    let started = Instant::now();
+    let result = run_ytdlp(
         &[
             "--flat-playlist",
             "--match-filter",
@@ -460,11 +485,24 @@ fn resolve_search(query: &str) -> Result<Vec<TrackItem>, ExtractorError> {
             SEARCH_METADATA_FORMAT,
         ],
         &format!("ytsearch3:{query}"),
-    )?
-    .lines()
-    .find_map(parse_metadata_line)
-    .map(|track| vec![track])
-    .ok_or(ExtractorError::NoResults)
+    )
+    .and_then(|output| {
+        output
+            .lines()
+            .find_map(parse_metadata_line)
+            .map(|track| vec![track])
+            .ok_or(ExtractorError::NoResults)
+    });
+    let outcome = match &result {
+        Ok(_) => "success",
+        Err(ExtractorError::NoResults) => "no_results",
+        Err(_) => "error",
+    };
+    eprintln!(
+        "[isle] extractor metadata_search outcome={outcome} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+    result
 }
 
 fn resolve_metadata(target: &str) -> Result<TrackItem, ExtractorError> {

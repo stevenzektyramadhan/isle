@@ -18,8 +18,8 @@ Aplikasi ini dirancang untuk mendengarkan lagu secara langsung tanpa browser, ta
   - **YouTube**: Link video, Shorts, atau playlist.
   - **Spotify**: Link track, album, atau playlist.
   - **Pencarian Teks**: Ketik judul lagu atau artis (misalnya `Terpukau Astrid`).
-- **Zero Disk Caching**: Audio distreaming di memori (`BufReader<reqwest::blocking::Response>` ke `rodio::Decoder`) tanpa file audio sementara.
-- **Lazy Stream Resolution**: Playlist dimuat sebagai antrean ringan; URL audio hanya di-resolve saat track tersebut akan diputar.
+- **Zero Disk Caching**: Audio dibaca bertahap dari HTTP stream ke `rodio::Decoder` tanpa file audio sementara.
+- **Lazy Stream Resolution**: Playlist dimuat sebagai antrean ringan; URL audio di-resolve saat track akan diputar. Saat playback aktif, Isle juga menyiapkan decoder untuk track berikutnya di thread terpisah. Hasil yang cocok digunakan jika berumur kurang dari 60 detik; jika belum siap, gagal, kedaluwarsa, atau tidak lagi cocok dengan antrean, aktivasi track menyiapkannya secara normal.
 - **Pintasan Keyboard**: Play/pause, seek, volume, dan perpindahan mode dari keyboard.
 - **Quick Mute & Volume Control**: Slider volume dengan tooltip persentase (`volume * 100`, maksimum 150%) serta klik ikon speaker untuk mute/unmute.
 - **Queue Peek Tooltip**: Hover tombol antrean untuk melihat preview 5 lagu berikutnya.
@@ -186,9 +186,12 @@ Saat dijalankan, Isle muncul sebagai kapsul kecil di layar.
 3. **Stream Resolver (`src/extractor.rs`)**:
    - Mengklasifikasikan URL media, playlist, atau teks pencarian.
    - Resolusi stream didelegasikan ke `yt-dlp`.
-   - Playlist dimuat sebagai antrean ringan; stream di-resolve saat track akan diputar.
+   - Playlist dimuat sebagai antrean ringan; stream di-resolve saat track akan diputar. Saat playback aktif, decoder untuk track antrean berikutnya disiapkan di thread terpisah. Hasilnya hanya digunakan bila masih cocok dengan track berikutnya dan berumur kurang dari 60 detik. Jika persiapan gagal atau hasilnya tidak tersedia atau kedaluwarsa, aktivasi menjalankan persiapan track secara normal. Perubahan antrean, pencarian, track sebelumnya, atau stop membatalkan hasil persiapan yang sedang berlaku.
+   - Audio dibaca bertahap dari HTTP melalui `HttpRangeReader` ke `rodio::Decoder` di RAM, tanpa file audio sementara. Jika server mendukung HTTP Range, reader mendukung seek dan menyambung ulang pembacaan range setelah kegagalan baca atau akhir respons sebelum panjang yang dinyatakan. Tanpa dukungan range, stream tetap dapat diputar tetapi tidak dapat di-seek.
+   - Pesan diagnostik audio ditulis ke stderr dengan prefix `[isle]`, mencakup kegagalan resolusi, koneksi HTTP/range, decoding, percobaan fallback pencarian, dan deteksi sumber cookie browser. Selain itu, `src/extractor.rs` mencatat timing terstruktur untuk pencarian metadata (`metadata_search`) dan setiap percobaan resolusi stream (`stream`), dengan field `stage`, `outcome`, dan `elapsed_ms`. Outcome pencarian metadata adalah `success`, `no_results`, atau `error`; outcome stream adalah `success`, `no_stream`, `unusable_stream`, atau `error`. Stage stream meliputi `primary`, `configured_browser`, `browser_candidate`, dan `final_fallback`. Log timing ini juga ditulis ke stderr. Log dapat memuat detail sumber cookie browser; jangan membagikan log tanpa memeriksanya dan menghapus informasi sensitif.
+   - Jalankan `cargo run` dari terminal untuk melihat stderr, atau gunakan `cargo run 2> isle.log` untuk menyimpannya. Pada Windows gunakan build debug dari terminal; build release memakai subsystem GUI dan tidak membuka konsol.
 4. **Zero Disk Caching**:
-   - Audio di-stream bertahap melalui `BufReader` ke `rodio::Decoder` di RAM; tidak ada file audio sementara.
+   - Stream audio dibaca bertahap ke decoder di RAM; tidak ada file audio sementara.
 5. **Jaringan**:
    - Client HTTP memakai `connect_timeout` 10 detik dan timeout 10 detik per operasi baca/range. Timeout dihitung per operasi, bukan sebagai deadline total stream, sehingga stream panjang tidak dipotong selama data terus mengalir.
 6. **Cookie Browser (fallback)**:
