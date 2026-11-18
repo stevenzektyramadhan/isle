@@ -20,6 +20,7 @@ Aplikasi ini dirancang untuk mendengarkan lagu secara langsung tanpa browser, ta
   - **Pencarian Teks**: Ketik judul lagu atau artis (misalnya `Terpukau Astrid`).
 - **Zero Disk Caching**: Audio dibaca bertahap dari HTTP stream ke `rodio::Decoder` tanpa file audio sementara.
 - **Lazy Stream Resolution**: Playlist dimuat sebagai antrean ringan; URL audio di-resolve saat track akan diputar. Saat playback aktif, Isle juga menyiapkan decoder untuk track berikutnya di thread terpisah. Hasil yang cocok digunakan jika berumur kurang dari 60 detik; jika belum siap, gagal, kedaluwarsa, atau tidak lagi cocok dengan antrean, aktivasi track menyiapkannya secara normal.
+- **Autoplay sesi**: Rekomendasi memakai track pertama dari input yang berhasil sebagai anchor, dengan satu kumpulan kandidat terbatas hingga 50 track. Track yang sudah dicoba dalam sesi disaring meskipun history 200 track terlampaui; saat kandidat habis atau pencarian gagal, status ditampilkan. Input baru yang berhasil memulai sesi baru. Track Spotify dicari berdasarkan judul dan artis di YouTube, tanpa Spotify API.
 - **Pintasan Keyboard**: Play/pause, seek, volume, dan perpindahan mode dari keyboard.
 - **Quick Mute & Volume Control**: Slider volume dengan tooltip persentase (`volume * 100`, maksimum 150%) serta klik ikon speaker untuk mute/unmute.
 - **Queue Peek Tooltip**: Hover tombol antrean untuk melihat preview 5 lagu berikutnya.
