@@ -10,9 +10,10 @@ use crate::{
 };
 use rodio::{Decoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use std::{
+    collections::HashSet,
     io::{self, Read, Seek, SeekFrom},
     sync::mpsc::{self, Receiver, Sender},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const MAX_AUTOMATIC_FAILURES: u8 = 3;
@@ -22,6 +23,7 @@ const MAX_HISTORY: usize = 200;
 // stalled range request/reconnect without capping the whole stream.
 const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const PREPARED_MAX_AGE: Duration = Duration::from_secs(60);
 
 fn clamped_seek_position(position: Duration, duration_secs: Option<u64>) -> Duration {
     duration_secs.map_or(position, |secs| position.min(Duration::from_secs(secs)))
@@ -101,6 +103,20 @@ struct PreparedTrack {
     detected_browser: Option<String>,
 }
 
+struct QueuedPreparation {
+    generation: u64,
+    track: TrackItem,
+    started: Instant,
+    result: PreparationState,
+}
+
+enum PreparationState {
+    Pending,
+    Ready(PreparedTrack),
+    Failed,
+    Expired,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ActivationOrigin {
     Automatic { radio_mix_loaded: bool },
@@ -113,6 +129,7 @@ struct ActivationRequest {
     track: TrackItem,
     client: Option<reqwest::blocking::Client>,
     cookies_browser: Option<String>,
+    prepared: Option<PreparedTrack>,
 }
 
 enum ActivationResult {
@@ -517,8 +534,12 @@ fn prepare_activation(request: ActivationRequest) -> ActivationResult {
         track,
         client,
         cookies_browser,
+        prepared,
     } = request;
-    match prepare_track(&track, client.as_ref(), cookies_browser.as_deref()) {
+    match prepared.map_or_else(
+        || prepare_track(&track, client.as_ref(), cookies_browser.as_deref()),
+        Ok,
+    ) {
         Ok(PreparedTrack {
             decoder,
             detected_browser,
@@ -538,6 +559,10 @@ fn prepare_activation(request: ActivationRequest) -> ActivationResult {
 
 struct Worker {
     state: PlayerState,
+    autoplay_anchor: Option<TrackItem>,
+    autoplay_played_ids: HashSet<String>,
+    autoplay_played_titles: HashSet<String>,
+    autoplay_fetched: bool,
     sink: Option<Sink>,
     backend: Option<AudioBackend>,
     state_tx: Sender<PlayerState>,
@@ -548,6 +573,11 @@ struct Worker {
     activation_rx: Receiver<ActivationResult>,
     play_when_ready: bool,
     activation_pending: bool,
+    preparation_generation: u64,
+    preparation: Option<QueuedPreparation>,
+    preparation_job: Option<std::thread::JoinHandle<()>>,
+    preparation_tx: Sender<(u64, Result<PreparedTrack, StartError>)>,
+    preparation_rx: Receiver<(u64, Result<PreparedTrack, StartError>)>,
 }
 
 fn submit_error_message(error: &ExtractorError) -> &'static str {
@@ -584,6 +614,88 @@ fn start_error_message(error: &StartError) -> &'static str {
 }
 
 impl Worker {
+    fn invalidate_preparation(&mut self) {
+        self.preparation_generation = self.preparation_generation.wrapping_add(1);
+        self.preparation = None;
+    }
+
+    fn prepare_next(&mut self) {
+        if !self.state.is_playing || self.backend.is_none() {
+            return;
+        }
+        let Some(track) = self.state.queue.front().cloned() else {
+            return;
+        };
+        let Some(generation) = self.schedule_preparation(&track) else {
+            return;
+        };
+        let client = self.backend.as_ref().map(|backend| backend.client.clone());
+        let cookies = self.cookies_browser.clone();
+        let tx = self.preparation_tx.clone();
+        self.preparation_job = Some(std::thread::spawn(move || {
+            let result = prepare_track(&track, client.as_ref(), cookies.as_deref());
+            let _ = tx.send((generation, result));
+        }));
+    }
+
+    fn schedule_preparation(&mut self, track: &TrackItem) -> Option<u64> {
+        self.process_preparation_results();
+        if self.preparation.as_ref().is_some_and(|p| p.track != *track) {
+            self.invalidate_preparation();
+        }
+        // Invalidation discards eligibility, never ownership of a running job.
+        if self.preparation_job.is_some() || self.preparation.is_some() {
+            return None;
+        }
+        self.preparation_generation = self.preparation_generation.wrapping_add(1);
+        let generation = self.preparation_generation;
+        self.preparation = Some(QueuedPreparation {
+            generation,
+            track: track.clone(),
+            started: Instant::now(),
+            result: PreparationState::Pending,
+        });
+        Some(generation)
+    }
+
+    fn process_preparation_results(&mut self) {
+        // Never join a live thread, including during stop or invalidation.
+        if self
+            .preparation_job
+            .as_ref()
+            .is_some_and(|job| job.is_finished())
+        {
+            if let Some(job) = self.preparation_job.take() {
+                if job.join().is_err() {
+                    if let Some(preparation) = self.preparation.as_mut() {
+                        preparation.result = PreparationState::Failed;
+                    }
+                }
+            }
+        }
+        while let Ok((generation, result)) = self.preparation_rx.try_recv() {
+            if let Some(preparation) = self.preparation.as_mut() {
+                if preparation.generation == generation {
+                    preparation.result = match result {
+                        Ok(prepared) => PreparationState::Ready(prepared),
+                        Err(_) => PreparationState::Failed,
+                    };
+                }
+            }
+        }
+        if let Some(preparation) = self.preparation.as_mut() {
+            if preparation.started.elapsed() >= PREPARED_MAX_AGE {
+                // Keep the attempt recorded: expiry must not launch refresh loops.
+                preparation.result = PreparationState::Expired;
+            }
+        }
+    }
+
+    fn clear_queue(&mut self) {
+        self.state.queue.clear();
+        self.invalidate_preparation();
+    }
+
     fn invalidate_activation(&mut self) {
         self.activation_generation = self.activation_generation.wrapping_add(1);
         self.activation_pending = false;
@@ -594,6 +706,10 @@ impl Worker {
         track: TrackItem,
         origin: ActivationOrigin,
     ) -> ActivationRequest {
+        self.autoplay_played_ids.insert(track.id.clone());
+        self.autoplay_played_titles
+            .insert(canonical_title(&track.title));
+        self.invalidate_preparation();
         self.invalidate_activation();
         if let Some(sink) = self.sink.take() {
             sink.stop();
@@ -611,6 +727,7 @@ impl Worker {
             track,
             client: self.backend.as_ref().map(|backend| backend.client.clone()),
             cookies_browser: self.cookies_browser.clone(),
+            prepared: None,
         }
     }
 
@@ -694,14 +811,27 @@ impl Worker {
     }
 
     fn submit(&mut self, input: &str) {
+        self.invalidate_preparation();
         self.invalidate_activation();
         self.consecutive_errors = 0;
         self.state.status_message = Some(format!("Searching {input}…"));
         let _ = self.state_tx.send(self.state.clone());
-        match resolve_input(input) {
+        self.accept_input(resolve_input(input));
+    }
+
+    fn start_autoplay_session(&mut self, track: &TrackItem) {
+        self.autoplay_anchor = Some(track.clone());
+        self.autoplay_played_ids.clear();
+        self.autoplay_played_titles.clear();
+        self.autoplay_fetched = false;
+    }
+
+    fn accept_input(&mut self, result: Result<Vec<TrackItem>, ExtractorError>) {
+        match result {
             Ok(tracks) => {
                 let mut tracks = tracks.into_iter();
                 if let Some(track) = tracks.next() {
+                    self.start_autoplay_session(&track);
                     if let Some(prev) = self.state.current_track.take() {
                         push_history(&mut self.state, prev);
                     }
@@ -722,6 +852,15 @@ impl Worker {
     }
 
     fn schedule_advance(&mut self, origin: ActivationOrigin) -> Option<ActivationRequest> {
+        self.schedule_advance_with(origin, fetch_related_tracks)
+    }
+
+    fn schedule_advance_with(
+        &mut self,
+        origin: ActivationOrigin,
+        fetch: impl FnOnce(&TrackItem) -> Result<Vec<TrackItem>, ExtractorError>,
+    ) -> Option<ActivationRequest> {
+        self.process_preparation_results();
         let (automatic, radio_mix_loaded) = match origin {
             ActivationOrigin::Automatic { radio_mix_loaded } => (true, radio_mix_loaded),
             ActivationOrigin::Manual => {
@@ -739,31 +878,71 @@ impl Worker {
             return None;
         }
 
-        if let Some(track) = advance_queue(&mut self.state) {
-            return Some(self.schedule_activation(track, origin));
+        if automatic
+            && self.preparation.as_ref().is_some_and(|preparation| {
+                self.state.queue.front() == Some(&preparation.track)
+                    && (matches!(preparation.result, PreparationState::Pending)
+                        || self.preparation_job.is_some())
+            })
+        {
+            // The worker keeps servicing commands while the existing job completes.
+            return None;
         }
 
-        if !radio_mix_loaded && self.state.autoplay_enabled {
-            if let Some(last) = self.state.history.last().cloned() {
+        if let Some(track) = advance_queue(&mut self.state) {
+            let prepared = self.preparation.take().and_then(|preparation| {
+                if preparation.track != track || preparation.started.elapsed() >= PREPARED_MAX_AGE {
+                    return None;
+                }
+                match preparation.result {
+                    PreparationState::Ready(prepared) => Some(prepared),
+                    PreparationState::Pending
+                    | PreparationState::Failed
+                    | PreparationState::Expired => None,
+                }
+            });
+            let mut request = self.schedule_activation(track, origin);
+            request.prepared = prepared;
+            return Some(request);
+        }
+
+        if !radio_mix_loaded && self.state.autoplay_enabled && !self.autoplay_fetched {
+            if let Some(last) = self.autoplay_anchor.clone() {
                 self.state.status_message = Some("Loading radio mix…".to_owned());
                 let _ = self.state_tx.send(self.state.clone());
-                if let Ok(related) = fetch_related_tracks(&last) {
-                    let fresh = related.into_iter().filter(|track| {
-                        !self.state.history.iter().any(|history_track| {
-                            history_track.id == track.id
-                                || canonical_title(&history_track.title)
-                                    == canonical_title(&track.title)
-                        })
-                    });
-                    self.state.queue.extend(fresh);
-                    if let Some(track) = advance_queue(&mut self.state) {
-                        let origin = match origin {
-                            ActivationOrigin::Automatic { .. } => ActivationOrigin::Automatic {
-                                radio_mix_loaded: true,
-                            },
-                            ActivationOrigin::Manual => ActivationOrigin::Manual,
-                        };
-                        return Some(self.schedule_activation(track, origin));
+                match fetch(&last) {
+                    Ok(related) => {
+                        self.autoplay_fetched = true;
+                        let fresh = related.into_iter().filter(|track| {
+                            !self.autoplay_played_ids.contains(&track.id)
+                                && !self
+                                    .autoplay_played_titles
+                                    .contains(&canonical_title(&track.title))
+                        });
+                        self.state.queue.extend(fresh);
+                        if let Some(track) = advance_queue(&mut self.state) {
+                            let origin = match origin {
+                                ActivationOrigin::Automatic { .. } => ActivationOrigin::Automatic {
+                                    radio_mix_loaded: true,
+                                },
+                                ActivationOrigin::Manual => ActivationOrigin::Manual,
+                            };
+                            return Some(self.schedule_activation(track, origin));
+                        }
+                    }
+                    Err(ExtractorError::NoResults) => self.autoplay_fetched = true,
+                    Err(error) => {
+                        eprintln!(
+                            "[isle] Autoplay lookup failed: {}",
+                            resolve_diagnostic(&error)
+                        );
+                        self.state.status_message =
+                            Some(format!("Autoplay: {}", submit_error_message(&error)));
+                        self.sink = None;
+                        self.state.is_playing = false;
+                        self.state.elapsed_secs = 0;
+                        self.play_when_ready = false;
+                        return None;
                     }
                 }
             }
@@ -773,6 +952,9 @@ impl Worker {
         self.state.is_playing = false;
         self.state.elapsed_secs = 0;
         self.play_when_ready = false;
+        if self.state.autoplay_enabled && (self.autoplay_anchor.is_some() || radio_mix_loaded) {
+            self.state.status_message = Some("Autoplay exhausted".to_owned());
+        }
         if matches!(origin, ActivationOrigin::Manual) {
             self.invalidate_activation();
         }
@@ -787,6 +969,7 @@ impl Worker {
 
     fn schedule_previous(&mut self) -> Option<ActivationRequest> {
         self.consecutive_errors = 0;
+        self.invalidate_preparation();
         self.invalidate_activation();
         pop_previous(&mut self.state)
             .map(|track| self.schedule_activation(track, ActivationOrigin::Manual))
@@ -818,6 +1001,7 @@ impl Worker {
     }
 
     fn stop(&mut self) {
+        self.invalidate_preparation();
         self.invalidate_activation();
         if let Some(sink) = self.sink.take() {
             sink.stop();
@@ -847,8 +1031,13 @@ pub fn spawn_audio_worker(
         }
         let cookies_browser = initial_config.cookies_browser.clone();
         let (activation_tx, activation_rx) = mpsc::channel();
+        let (preparation_tx, preparation_rx) = mpsc::channel();
         let mut worker = Worker {
             state,
+            autoplay_anchor: None,
+            autoplay_played_ids: HashSet::new(),
+            autoplay_played_titles: HashSet::new(),
+            autoplay_fetched: false,
             sink: None,
             backend: AudioBackend::new(),
             state_tx: state_tx.clone(),
@@ -859,6 +1048,11 @@ pub fn spawn_audio_worker(
             activation_rx,
             play_when_ready: false,
             activation_pending: false,
+            preparation_generation: 0,
+            preparation: None,
+            preparation_job: None,
+            preparation_tx,
+            preparation_rx,
         };
         #[cfg(not(windows))]
         let mut media_keys = MediaKeyManager::new(media_tx);
@@ -870,6 +1064,7 @@ pub fn spawn_audio_worker(
             match cmd_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(AudioCommand::SubmitInput(input)) => worker.submit(&input),
                 Ok(AudioCommand::PlayTrack(track)) => {
+                    worker.start_autoplay_session(&track);
                     worker.activate(track, ActivationOrigin::Manual);
                 }
                 Ok(AudioCommand::TogglePlayPause) => worker.toggle(),
@@ -895,7 +1090,7 @@ pub fn spawn_audio_worker(
                 }
                 Ok(AudioCommand::Enqueue(track)) => worker.state.queue.push_back(track),
                 Ok(AudioCommand::EnqueueBatch(tracks)) => worker.state.queue.extend(tracks),
-                Ok(AudioCommand::ClearQueue) => worker.state.queue.clear(),
+                Ok(AudioCommand::ClearQueue) => worker.clear_queue(),
                 Ok(AudioCommand::ToggleWindowVisibility) => {}
                 Ok(AudioCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     worker.stop();
@@ -904,6 +1099,7 @@ pub fn spawn_audio_worker(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             worker.process_activation_results();
+            worker.process_preparation_results();
             if worker.state.is_playing {
                 if let Some(sink) = worker.sink.as_ref() {
                     worker.state.elapsed_secs = sink.get_pos().as_secs();
@@ -916,6 +1112,7 @@ pub fn spawn_audio_worker(
                     radio_mix_loaded: false,
                 });
             }
+            worker.prepare_next();
             if worker.state != last_published_state {
                 #[cfg(not(windows))]
                 if media_state_changed(&last_published_state, &worker.state) {
@@ -1066,12 +1263,17 @@ mod tests {
     fn worker_with_tracks(consecutive_errors: u8, track_ids: &[&str]) -> Worker {
         let (state_tx, _state_rx) = mpsc::channel();
         let (activation_tx, activation_rx) = mpsc::channel();
+        let (preparation_tx, preparation_rx) = mpsc::channel();
         let mut state = PlayerState::default();
         state
             .queue
             .extend(track_ids.iter().map(|track_id| track(track_id)));
         Worker {
             state,
+            autoplay_anchor: None,
+            autoplay_played_ids: HashSet::new(),
+            autoplay_played_titles: HashSet::new(),
+            autoplay_fetched: false,
             sink: None,
             backend: None,
             state_tx,
@@ -1082,11 +1284,147 @@ mod tests {
             activation_rx,
             play_when_ready: false,
             activation_pending: false,
+            preparation_generation: 0,
+            preparation: None,
+            preparation_job: None,
+            preparation_tx,
+            preparation_rx,
         }
     }
 
     fn worker_with_queue(consecutive_errors: u8) -> Worker {
         worker_with_tracks(consecutive_errors, &["next"])
+    }
+
+    #[test]
+    fn autoplay_reports_exhaustion_after_a_loaded_mix_is_consumed() {
+        let mut worker = worker_with_tracks(0, &[]);
+        worker.state.autoplay_enabled = true;
+        worker.state.current_track = Some(track("last"));
+
+        assert!(worker
+            .schedule_advance(ActivationOrigin::Automatic {
+                radio_mix_loaded: true,
+            })
+            .is_none());
+        assert_eq!(
+            worker.state.status_message.as_deref(),
+            Some("Autoplay exhausted")
+        );
+    }
+
+    #[test]
+    fn autoplay_keeps_anchor_and_filters_session_tracks_beyond_history_limit() {
+        let mut worker = worker_with_tracks(0, &[]);
+        worker.state.autoplay_enabled = true;
+        worker.autoplay_anchor = Some(track("anchor"));
+        for index in 0..205 {
+            let item = track(&format!("played-{index}"));
+            worker.autoplay_played_ids.insert(item.id.clone());
+            worker
+                .autoplay_played_titles
+                .insert(canonical_title(&item.title));
+            push_history(&mut worker.state, item);
+        }
+        worker.state.current_track = Some(track("last"));
+        let request = worker
+            .schedule_advance_with(ActivationOrigin::Manual, |anchor| {
+                assert_eq!(anchor.id, "anchor");
+                Ok(vec![
+                    track("played-0"),
+                    track("played-1"),
+                    track("played-2"),
+                    track("played-3"),
+                    track("played-4"),
+                    track("fresh"),
+                ])
+            })
+            .unwrap();
+        assert_eq!(request.track.id, "fresh");
+        assert!(worker
+            .schedule_advance_with(ActivationOrigin::Manual, |_| panic!(
+                "pool must not be fetched twice"
+            ))
+            .is_none());
+        assert_eq!(
+            worker.state.status_message.as_deref(),
+            Some("Autoplay exhausted")
+        );
+    }
+
+    #[test]
+    fn autoplay_reports_lookup_failure() {
+        let mut worker = worker_with_tracks(0, &[]);
+        worker.state.autoplay_enabled = true;
+        worker.autoplay_anchor = Some(track("anchor"));
+        assert!(worker
+            .schedule_advance_with(ActivationOrigin::Manual, |_| Err(
+                ExtractorError::MissingBinary
+            ))
+            .is_none());
+        assert_eq!(
+            worker.state.status_message.as_deref(),
+            Some("Autoplay: yt-dlp not found")
+        );
+        assert!(!worker.state.is_playing);
+        assert!(!worker.play_when_ready);
+        let retry = worker
+            .schedule_advance_with(ActivationOrigin::Manual, |anchor| {
+                assert_eq!(anchor.id, "anchor");
+                Ok(vec![track("retry-result")])
+            })
+            .unwrap();
+        assert_eq!(retry.track.id, "retry-result");
+    }
+
+    #[test]
+    fn autoplay_no_results_is_exhausted_without_refetching() {
+        let mut worker = worker_with_tracks(0, &[]);
+        worker.state.autoplay_enabled = true;
+        worker.autoplay_anchor = Some(track("anchor"));
+        assert!(worker
+            .schedule_advance_with(ActivationOrigin::Manual, |_| Err(ExtractorError::NoResults))
+            .is_none());
+        assert_eq!(
+            worker.state.status_message.as_deref(),
+            Some("Autoplay exhausted")
+        );
+        assert!(worker
+            .schedule_advance_with(ActivationOrigin::Manual, |_| panic!(
+                "exhausted mix refetched"
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn successful_input_replaces_anchor_but_failed_input_preserves_it() {
+        let mut worker = worker_with_tracks(0, &[]);
+        worker.autoplay_anchor = Some(track("old"));
+        worker.autoplay_fetched = true;
+        worker.accept_input(Err(ExtractorError::NoResults));
+        assert_eq!(worker.autoplay_anchor.as_ref().unwrap().id, "old");
+        worker.accept_input(Ok(vec![track("new"), track("queued")]));
+        assert_eq!(worker.autoplay_anchor.as_ref().unwrap().id, "new");
+        assert!(!worker.autoplay_fetched);
+        assert_eq!(worker.state.queue.front().unwrap().id, "queued");
+    }
+
+    #[test]
+    fn direct_track_starts_new_session_and_queue_advancement_keeps_its_anchor() {
+        let mut worker = worker_with_tracks(0, &["queued"]);
+        worker.state.autoplay_enabled = true;
+        worker.start_autoplay_session(&track("old"));
+        worker.autoplay_fetched = true;
+        worker.start_autoplay_session(&track("direct"));
+        worker.schedule_activation(track("direct"), ActivationOrigin::Manual);
+        worker.schedule_advance_with(ActivationOrigin::Manual, |_| panic!("queue is not empty"));
+        let request = worker
+            .schedule_advance_with(ActivationOrigin::Manual, |anchor| {
+                assert_eq!(anchor.id, "direct");
+                Ok(vec![track("direct"), track("queued"), track("fresh")])
+            })
+            .unwrap();
+        assert_eq!(request.track.id, "fresh");
     }
 
     fn failed_activation(generation: u64, origin: ActivationOrigin) -> ActivationResult {
@@ -1103,6 +1441,283 @@ mod tests {
             origin: ActivationOrigin::Manual,
             decoder: Box::new(rodio::source::Zero::new(1, 44_100)),
             detected_browser: browser.map(str::to_owned),
+        }
+    }
+
+    fn queued_preparation(worker: &mut Worker, id: &str, age: Duration) -> u64 {
+        worker.preparation_generation = worker.preparation_generation.wrapping_add(1);
+        let generation = worker.preparation_generation;
+        worker.preparation = Some(QueuedPreparation {
+            generation,
+            track: track(id),
+            started: Instant::now() - age,
+            result: PreparationState::Pending,
+        });
+        generation
+    }
+
+    fn prepared_track() -> PreparedTrack {
+        PreparedTrack {
+            decoder: Box::new(rodio::source::Zero::new(1, 44_100)),
+            detected_browser: Some("firefox".to_owned()),
+        }
+    }
+
+    #[test]
+    fn invalidation_keeps_speculation_bounded_until_job_exits() {
+        let mut worker = worker_with_queue(0);
+        let generation = worker.schedule_preparation(&track("next")).unwrap();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let tx = worker.preparation_tx.clone();
+        worker.preparation_job = Some(thread::spawn(move || {
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            tx.send((generation, Ok(prepared_track()))).unwrap();
+            finished_tx.send(()).unwrap();
+        }));
+
+        for _ in 0..100 {
+            worker.invalidate_preparation();
+            assert!(worker.schedule_preparation(&track("replacement")).is_none());
+            worker.set_volume(0.5);
+        }
+        worker.stop();
+        assert!(worker.schedule_preparation(&track("replacement")).is_none());
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.preparation_job.is_some() {
+            assert!(Instant::now() < deadline, "finished job was not reaped");
+            worker.process_preparation_results();
+            thread::yield_now();
+        }
+        assert!(
+            worker.preparation.is_none(),
+            "stale result must be discarded"
+        );
+        assert!(worker.schedule_preparation(&track("replacement")).is_some());
+    }
+
+    #[test]
+    fn panicked_preparation_is_failed_without_retries() {
+        let mut worker = worker_with_queue(0);
+        worker.schedule_preparation(&track("next")).unwrap();
+        worker.preparation_job = Some(thread::spawn(|| panic!("preparation failed")));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while worker.preparation_job.is_some() {
+            assert!(Instant::now() < deadline, "panicked job was not reaped");
+            worker.process_preparation_results();
+            thread::yield_now();
+        }
+
+        assert!(matches!(
+            worker.preparation.as_ref().unwrap().result,
+            PreparationState::Failed
+        ));
+        assert!(worker.schedule_preparation(&track("next")).is_none());
+        assert!(worker
+            .schedule_advance(ActivationOrigin::Manual)
+            .unwrap()
+            .prepared
+            .is_none());
+    }
+
+    #[test]
+    fn failed_and_expired_attempts_do_not_retry_on_worker_ticks() {
+        for succeeds in [true, false] {
+            let mut worker = worker_with_queue(0);
+            let generation = worker.schedule_preparation(&track("next")).unwrap();
+            worker
+                .preparation_tx
+                .send((
+                    generation,
+                    if succeeds {
+                        Ok(prepared_track())
+                    } else {
+                        Err(StartError::Decode)
+                    },
+                ))
+                .unwrap();
+            worker.process_preparation_results();
+            if !succeeds {
+                assert!(matches!(
+                    worker.preparation.as_ref().unwrap().result,
+                    PreparationState::Failed
+                ));
+            }
+            worker.preparation.as_mut().unwrap().started = Instant::now() - PREPARED_MAX_AGE;
+
+            for _ in 0..100 {
+                assert!(worker.schedule_preparation(&track("next")).is_none());
+            }
+            let request = worker.schedule_advance(ActivationOrigin::Manual).unwrap();
+            assert!(request.prepared.is_none());
+        }
+    }
+
+    #[test]
+    fn manual_next_does_not_wait_for_pending_preparation() {
+        let mut worker = worker_with_queue(0);
+        let generation = queued_preparation(&mut worker, "next", Duration::ZERO);
+
+        let request = worker.schedule_advance(ActivationOrigin::Manual).unwrap();
+
+        assert!(request.prepared.is_none());
+        assert_eq!(request.track, track("next"));
+        worker
+            .preparation_tx
+            .send((generation, Ok(prepared_track())))
+            .unwrap();
+        worker.process_preparation_results();
+        assert!(worker.preparation.is_none());
+        assert!(worker.activation_pending);
+    }
+
+    #[test]
+    fn automatic_advance_uses_pending_job_when_it_completes() {
+        let mut worker = worker_with_queue(0);
+        let generation = queued_preparation(&mut worker, "next", Duration::ZERO);
+        let origin = ActivationOrigin::Automatic {
+            radio_mix_loaded: false,
+        };
+        assert!(worker.schedule_advance(origin).is_none());
+        worker
+            .preparation_tx
+            .send((generation, Ok(prepared_track())))
+            .unwrap();
+
+        let request = worker.schedule_advance(origin).unwrap();
+
+        assert!(matches!(
+            prepare_activation(request),
+            ActivationResult::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn automatic_advance_leaves_pending_preparation_in_flight() {
+        let mut worker = worker_with_queue(0);
+        queued_preparation(&mut worker, "next", Duration::ZERO);
+
+        let request = worker.schedule_advance(ActivationOrigin::Automatic {
+            radio_mix_loaded: false,
+        });
+
+        assert!(
+            request.is_none(),
+            "automatic advance must not duplicate preparation"
+        );
+        assert_eq!(worker.state.queue.front(), Some(&track("next")));
+        assert!(worker.preparation.is_some());
+    }
+
+    #[test]
+    fn next_uses_fresh_preparation_without_resolving_again() {
+        let mut worker = worker_with_queue(0);
+        let generation = queued_preparation(&mut worker, "next", Duration::ZERO);
+        worker
+            .preparation_tx
+            .send((generation, Ok(prepared_track())))
+            .unwrap();
+        worker.process_preparation_results();
+        let request = worker.schedule_advance(ActivationOrigin::Manual).unwrap();
+        assert!(
+            matches!(prepare_activation(request), ActivationResult::Ready { detected_browser: Some(browser), .. } if browser == "firefox")
+        );
+    }
+
+    #[test]
+    fn next_consumes_completed_preparation_before_worker_poll() {
+        let mut worker = worker_with_queue(0);
+        let generation = queued_preparation(&mut worker, "next", Duration::ZERO);
+        worker
+            .preparation_tx
+            .send((generation, Ok(prepared_track())))
+            .unwrap();
+
+        let request = worker.schedule_advance(ActivationOrigin::Manual).unwrap();
+
+        assert!(matches!(
+            prepare_activation(request),
+            ActivationResult::Ready { .. }
+        ));
+    }
+
+    #[test]
+    fn expired_or_failed_preparation_falls_back_to_activation() {
+        for (age, succeeds) in [(Duration::from_secs(61), true), (Duration::ZERO, false)] {
+            let mut worker = worker_with_queue(0);
+            let generation = queued_preparation(&mut worker, "next", age);
+            let result = if succeeds {
+                Ok(prepared_track())
+            } else {
+                Err(StartError::Decode)
+            };
+            worker.preparation_tx.send((generation, result)).unwrap();
+            worker.process_preparation_results();
+            let request = worker.schedule_advance(ActivationOrigin::Manual).unwrap();
+            assert!(matches!(
+                prepare_activation(request),
+                ActivationResult::Failed {
+                    error: StartError::NoAudioDevice,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn invalidated_late_results_cannot_replace_new_preparation() {
+        let mut worker = worker_with_queue(0);
+        let old = queued_preparation(&mut worker, "next", Duration::ZERO);
+        worker.invalidate_preparation();
+        let current = queued_preparation(&mut worker, "next", Duration::ZERO);
+        worker
+            .preparation_tx
+            .send((old, Ok(prepared_track())))
+            .unwrap();
+        worker.process_preparation_results();
+        let request = worker.schedule_advance(ActivationOrigin::Manual).unwrap();
+        assert_ne!(old, current);
+        assert!(matches!(
+            prepare_activation(request),
+            ActivationResult::Failed {
+                error: StartError::NoAudioDevice,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn previous_search_and_stop_invalidate_preparation() {
+        for action in 0..4 {
+            let mut worker = worker_with_queue(0);
+            let generation = queued_preparation(&mut worker, "next", Duration::ZERO);
+            match action {
+                0 => {
+                    worker.schedule_previous();
+                }
+                1 => worker.submit(""),
+                2 => worker.stop(),
+                3 => {
+                    worker.clear_queue();
+                    worker.state.queue.push_back(track("next"));
+                }
+                _ => unreachable!(),
+            }
+            worker
+                .preparation_tx
+                .send((generation, Ok(prepared_track())))
+                .unwrap();
+            worker.process_preparation_results();
+            let request = worker.schedule_advance(ActivationOrigin::Manual).unwrap();
+            assert!(matches!(
+                prepare_activation(request),
+                ActivationResult::Failed {
+                    error: StartError::NoAudioDevice,
+                    ..
+                }
+            ));
         }
     }
 
