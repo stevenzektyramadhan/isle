@@ -430,23 +430,30 @@ pub fn canonical_title(title: &str) -> String {
 }
 
 pub fn fetch_related_tracks(last_track: &TrackItem) -> Result<Vec<TrackItem>, ExtractorError> {
+    fetch_related_tracks_with(last_track, run_ytdlp)
+}
+
+fn fetch_related_tracks_with(
+    last_track: &TrackItem,
+    run: impl Fn(&[&str], &str) -> Result<String, ExtractorError>,
+) -> Result<Vec<TrackItem>, ExtractorError> {
     let mix = format!(
         "https://www.youtube.com/watch?v={}&list=RD{}",
         last_track.id, last_track.id
     );
-    let raw = run_ytdlp(
-        &[
-            "--flat-playlist",
-            "-I",
-            "2:10",
-            "--print",
-            SEARCH_METADATA_FORMAT,
-        ],
-        &mix,
-    )
-    .or_else(|_| {
-        let seed = last_track.artist.as_deref().unwrap_or(&last_track.title);
-        run_ytdlp(
+    let search = format!(
+        "ytsearch50:{} {} audio",
+        last_track.title,
+        last_track.artist.as_deref().unwrap_or("")
+    );
+    let youtube = Url::parse(&last_track.original_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com")
+        });
+    let raw = if !youtube {
+        run(
             &[
                 "--flat-playlist",
                 "--match-filter",
@@ -454,22 +461,49 @@ pub fn fetch_related_tracks(last_track: &TrackItem) -> Result<Vec<TrackItem>, Ex
                 "--print",
                 SEARCH_METADATA_FORMAT,
             ],
-            &format!("ytsearch6:{seed} audio"),
+            &search,
         )
-    })?;
+    } else {
+        run(
+            &[
+                "--flat-playlist",
+                "-I",
+                "2:50",
+                "--print",
+                SEARCH_METADATA_FORMAT,
+            ],
+            &mix,
+        )
+        .or_else(|_| {
+            run(
+                &[
+                    "--flat-playlist",
+                    "--match-filter",
+                    "live_status!=is_live",
+                    "--print",
+                    SEARCH_METADATA_FORMAT,
+                ],
+                &search,
+            )
+        })
+    }?;
     let mut seen = vec![canonical_title(&last_track.title)];
+    let mut ids = std::collections::HashSet::new();
     let tracks = raw
         .lines()
         .filter_map(parse_metadata_line)
         .filter(|track| {
             let canon = canonical_title(&track.title);
-            let fresh = track.id != last_track.id && !canon.is_empty() && !seen.contains(&canon);
+            let fresh = track.id != last_track.id
+                && !canon.is_empty()
+                && !seen.contains(&canon)
+                && ids.insert(track.id.clone());
             if fresh {
                 seen.push(canon);
             }
             fresh
         })
-        .take(4)
+        .take(50)
         .collect();
     require_tracks(tracks)
 }
@@ -796,6 +830,44 @@ pub fn parse_spotify_oembed_title(json_str: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn related_tracks_choose_source_and_keep_distinct_candidates_beyond_four() {
+        let spotify = spotify_track_item(&serde_json::json!({"uri":"spotify:track:spotify123", "title":"Anchor", "subtitle":"Artist"})).unwrap();
+        let direct = TrackItem {
+            id: "youtube1234".into(),
+            original_url: "https://www.youtube.com/watch?v=youtube1234".into(),
+            ..spotify.clone()
+        };
+        for (anchor, expected) in [
+            (spotify, "ytsearch50:Anchor Artist audio"),
+            (
+                direct,
+                "https://www.youtube.com/watch?v=youtube1234&list=RDyoutube1234",
+            ),
+        ] {
+            let result = fetch_related_tracks_with(&anchor, |_, target| {
+                if target != expected {
+                    return Err(ExtractorError::NoResults);
+                }
+                Ok((0..6)
+                    .map(|i| {
+                        format!(
+                            "id{i}:::Song {i}:::Artist:::https://youtube.com/watch?v=id{i}:::100\n"
+                        )
+                    })
+                    .collect())
+            })
+            .unwrap();
+            assert_eq!(
+                result
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["id0", "id1", "id2", "id3", "id4", "id5"]
+            );
+        }
+    }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
