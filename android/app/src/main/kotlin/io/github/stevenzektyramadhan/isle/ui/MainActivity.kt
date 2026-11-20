@@ -1,8 +1,12 @@
 package io.github.stevenzektyramadhan.isle.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -16,12 +20,16 @@ import io.github.stevenzektyramadhan.isle.model.PlayerCommand
 import io.github.stevenzektyramadhan.isle.player.PlayerEngine
 
 class MainActivity : ComponentActivity() {
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { _ -> }
     private val playerViewModel: PlayerViewModel by viewModels {
         PlayerViewModel.Factory((application as IsleApp).playerEngine)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
         setContent {
             val playerState by playerViewModel.state.collectAsStateWithLifecycle()
             var input by rememberSaveable { mutableStateOf("") }
@@ -42,9 +50,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        playerViewModel.setVisible(true)
+    }
+
     override fun onStop() {
+        playerViewModel.setVisible(false)
         super.onStop()
-        if (!isChangingConfigurations) playerViewModel.leaveForeground()
     }
 }
 
@@ -58,7 +71,7 @@ class PlayerViewModel(private val engine: PlayerEngine) : ViewModel() {
         engine.dispatch(PlayerCommand.TogglePlayPause)
     }
 
-    fun leaveForeground() = engine.leaveForeground()
+    fun setVisible(visible: Boolean) = engine.setVisible(visible)
 
     class Factory(private val engine: PlayerEngine) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")

@@ -28,6 +28,7 @@ dependencies {
     implementation(libs.lifecycle.runtime.compose)
     implementation(libs.lifecycle.viewmodel)
     implementation(libs.media3.exoplayer)
+    implementation(libs.media3.session)
     implementation(libs.youtubedl)
     implementation(libs.coroutines.android)
     implementation(libs.serialization.json)

@@ -8,4 +8,6 @@ sealed interface PlayerCommand {
     data class SubmitInput(val input: String) : PlayerCommand
     data object TogglePlayPause : PlayerCommand
     data object Stop : PlayerCommand
+    data object Next : PlayerCommand
+    data object Previous : PlayerCommand
 }
