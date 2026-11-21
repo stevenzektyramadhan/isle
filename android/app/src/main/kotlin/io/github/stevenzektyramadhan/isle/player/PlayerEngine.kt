@@ -17,12 +17,12 @@ import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
+import io.github.stevenzektyramadhan.isle.Timing
 import io.github.stevenzektyramadhan.isle.data.ExtractorRepository
 import io.github.stevenzektyramadhan.isle.data.ResolvedStream
-import io.github.stevenzektyramadhan.isle.domain.ExtractorError
 import io.github.stevenzektyramadhan.isle.model.*
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.flow.StateFlow
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -38,75 +38,55 @@ class PlayerEngine(private val context: Context) {
     private var controller: ListenableFuture<MediaController>? = null
     private var connectionGeneration = 0L
     private var visible = false
-    private val mutableState = MutableStateFlow(PlayerState())
-    val state: StateFlow<PlayerState> = mutableState.asStateFlow()
-    private var job: Job? = null
-    private var generation = 0L
     private var mediaGeneration = 0L
     private var mediaSequence = 0L
+    private var readyStarted: Long? = null
     private val recovery = PlaybackRecovery()
+    private val coordinator: PlaybackCoordinator = PlaybackCoordinator(extractor, scope, object : PlaybackOutput {
+        override suspend fun connect() {
+            Timing.android.measure(Timing.Stage.SERVICE_CONNECTION) {
+                if (controller == null && !visible) throw java.util.concurrent.ExecutionException(IllegalStateException("Foreground required"))
+                awaitSession()
+            }
+        }
+        override fun install(track: TrackItem, stream: ResolvedStream, generation: Long) = installStream(track, stream, generation)
+        override fun play(ready: Boolean) { player.playWhenReady = ready }
+        override fun stop() { finishReadyTiming(Timing.Outcome.CANCELLED); player.stop(); player.clearMediaItems() }
+    })
+    val state: StateFlow<PlayerState> = coordinator.state
+    fun noteStatus(message: String) = coordinator.noteStatus(message)
 
     init {
         player.addListener(object : Player.Listener {
-            override fun onIsPlayingChanged(isPlaying: Boolean) { mutableState.update { it.copy(isPlaying = isPlaying) } }
+            override fun onIsPlayingChanged(isPlaying: Boolean) { coordinator.playingChanged(isPlaying) }
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                if (reason != Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST) coordinator.playIntentChanged(playWhenReady)
+            }
             override fun onPlaybackStateChanged(playbackState: Int) {
-                if (playbackState == Player.STATE_READY) recovery.ready(player.currentMediaItem?.mediaId)
+                if (playbackState == Player.STATE_READY) { finishReadyTiming(Timing.Outcome.SUCCESS); recovery.ready(player.currentMediaItem?.mediaId); coordinator.ready(mediaGeneration) }
+                if (playbackState == Player.STATE_ENDED) coordinator.ended(mediaGeneration)
             }
             override fun onPlayerError(error: PlaybackException) {
-                if (player.playerError !== error || mediaGeneration != generation) return
+                if (player.playerError !== error) return
+                finishReadyTiming(Timing.Outcome.ERROR)
                 val status = generateSequence(error.cause) { it.cause }
                     .filterIsInstance<HttpDataSource.InvalidResponseCodeException>().firstOrNull()?.responseCode
-                val track = recovery.retry(generation, player.currentMediaItem?.mediaId, status)
-                if (track == null) { reportUnavailable("Playback failed"); return }
-                val current = generation
-                mutableState.update { it.copy(isLoading = true, statusMessage = "Retrying playback…") }
-                job?.cancel()
-                job = scope.launch {
-                    try {
-                        val stream = extractor.resolveStream(track, finalOnly = true)
-                        if (current != generation) return@launch
-                        if (!visible) { reportUnavailable("Open Isle to start playback"); return@launch }
-                        installStream(track, stream, current)
-                    } catch (error: ExtractorError) {
-                        if (current == generation) reportUnavailable("Playback failed")
-                    }
-                }
+                val track = recovery.retry(mediaGeneration, player.currentMediaItem?.mediaId, status)
+                if (track == null) coordinator.activationFailed(mediaGeneration)
+                else coordinator.retry(track, mediaGeneration)
             }
         })
-        scope.launch { val available = extractor.isAvailable(); mutableState.update { it.copy(ytdlpAvailable = available, statusMessage = if (available) it.statusMessage else "yt-dlp is unavailable") } }
+        scope.launch { coordinator.availability(extractor.isAvailable()) }
     }
 
     fun dispatch(command: PlayerCommand) {
         check(Looper.myLooper() == Looper.getMainLooper())
-        when (command) {
-            is PlayerCommand.SubmitInput -> submit(command.input)
-            PlayerCommand.TogglePlayPause -> if (player.playWhenReady) player.pause() else resumePlayback()
-            PlayerCommand.Stop -> { generation++; job?.cancel(); player.stop(); player.clearMediaItems(); disconnect(); mutableState.update { it.copy(currentTrack = null, isPlaying = false, isLoading = false, statusMessage = null) } }
-            PlayerCommand.Next, PlayerCommand.Previous -> Unit
-        }
-    }
-
-    private fun submit(input: String) {
-        val current = ++generation
-        job?.cancel()
-        mutableState.update { it.copy(isLoading = true, statusMessage = "Searching ${input.trim()}…") }
-        job = scope.launch {
-            try {
-                val track = extractor.resolveInput(input)
-                val stream = extractor.resolveStream(track)
-                awaitSession()
-                if (current != generation) return@launch
-                if (!visible) { reportUnavailable("Open Isle to start playback"); return@launch }
-                installStream(track, stream, current)
-            } catch (error: ExtractorError) {
-                if (current == generation) mutableState.update { it.copy(isLoading = false, statusMessage = error.message) }
-            } catch (error: java.util.concurrent.ExecutionException) {
-                if (current == generation) { disconnect(); reportUnavailable("Playback service unavailable") }
-            }
-        }
+        coordinator.dispatch(command)
+        if (command == PlayerCommand.Stop) disconnect()
     }
 
     private fun installStream(track: TrackItem, resolved: ResolvedStream, current: Long) {
+        finishReadyTiming(Timing.Outcome.CANCELLED)
         val factory = DefaultHttpDataSource.Factory()
         resolved.stream.userAgent?.let { factory.setUserAgent(it) }
         val mediaId = (++mediaSequence).toString()
@@ -115,9 +95,13 @@ class PlayerEngine(private val context: Context) {
         mediaGeneration = current
         recovery.start(track, current, mediaId, resolved.finalStrategy)
         player.setMediaSource(ProgressiveMediaSource.Factory(factory).createMediaSource(item))
+        readyStarted = Timing.android.start()
         player.prepare()
-        player.play()
-        mutableState.update { it.copy(currentTrack = track, isLoading = false, statusMessage = null) }
+    }
+
+    private fun finishReadyTiming(outcome: Timing.Outcome) {
+        readyStarted?.let { Timing.android.record(Timing.Stage.PLAYER_READY, outcome, it) }
+        readyStarted = null
     }
 
     private suspend fun awaitSession() = suspendCancellableCoroutine<Unit> { continuation ->
@@ -128,7 +112,7 @@ class PlayerEngine(private val context: Context) {
                     if (attempt == connectionGeneration) {
                         disconnect()
                         player.pause()
-                        reportUnavailable("Playback service disconnected")
+                        coordinator.unavailable("Playback service disconnected")
                     }
                 }
             }).buildAsync().also { controller = it }
@@ -146,14 +130,6 @@ class PlayerEngine(private val context: Context) {
     fun setVisible(isVisible: Boolean) {
         check(Looper.myLooper() == Looper.getMainLooper())
         visible = isVisible
-        if (!isVisible) {
-            if (job?.isActive == true) {
-                generation++
-                job?.cancel()
-                reportUnavailable("Open Isle to start playback")
-            }
-            disconnect()
-        }
     }
 
     private fun disconnect() {
@@ -163,28 +139,9 @@ class PlayerEngine(private val context: Context) {
         if (old != null) MediaController.releaseFuture(old)
     }
 
-    private fun reportUnavailable(message: String) {
-        mutableState.update { it.copy(isLoading = false, statusMessage = message) }
-    }
-
-    private fun resumePlayback() {
-        if (!visible) { reportUnavailable("Open Isle to start playback"); return }
-        val current = ++generation
-        job?.cancel()
-        job = scope.launch {
-            try {
-                awaitSession()
-                if (current == generation && visible) player.play()
-            } catch (error: java.util.concurrent.ExecutionException) {
-                if (current == generation) { disconnect(); reportUnavailable("Playback service unavailable") }
-            }
-        }
-    }
-
     fun foregroundStartFailed() {
-        player.pause()
-        reportUnavailable("Background playback unavailable; open Isle and try again")
+        coordinator.unavailable("Background playback unavailable; open Isle and try again")
     }
 
-    fun release() { check(Looper.myLooper() == Looper.getMainLooper()); job?.cancel(); scope.cancel(); disconnect(); player.release() }
+    fun release() { check(Looper.myLooper() == Looper.getMainLooper()); finishReadyTiming(Timing.Outcome.CANCELLED); coordinator.release(); scope.cancel(); disconnect(); player.release() }
 }
