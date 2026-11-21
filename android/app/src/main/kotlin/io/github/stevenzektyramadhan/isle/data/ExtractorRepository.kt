@@ -14,6 +14,8 @@ private const val SEARCH_FORMAT = "%(id)s:::%(title)s:::%(uploader)s:::%(url)s::
 private const val METADATA_FORMAT = "%(id)s:::%(title)s:::%(uploader)s:::%(webpage_url)s:::%(duration)s"
 private const val STREAM_FORMAT = "ba[ext=m4a][protocol^=http]/ba[ext=mp3][protocol^=http]/ba[acodec^=vorbis][protocol^=http]/ba[protocol^=http]/b[protocol^=http]"
 
+data class ResolvedStream(val stream: StreamInfo, val finalStrategy: Boolean)
+
 class ExtractorRepository(context: Context, scope: CoroutineScope) {
     private val initialized = scope.async(Dispatchers.IO) {
         try { YoutubeDL.init(context.applicationContext); true } catch (_: Exception) { false }
@@ -28,16 +30,18 @@ class ExtractorRepository(context: Context, scope: CoroutineScope) {
         }.lineSequence().mapNotNull(::parseMetadataLine).firstOrNull() ?: throw ExtractorError.NoResults
     }
 
-    suspend fun resolveStream(track: TrackItem): StreamInfo {
+    suspend fun resolveStream(track: TrackItem, finalOnly: Boolean = false): ResolvedStream {
         withContext(Dispatchers.IO) { InputClassifier.classify(track.originalUrl) }
         val common = listOf("-j", "-f", STREAM_FORMAT, "--no-playlist")
         var lastError: ExtractorError? = null
-        for ((index, client) in listOf("visionos,default", "android,web").withIndex()) {
+        val clients = if (finalOnly) listOf("android,web") else listOf("visionos,default", "android,web")
+        for (client in clients) {
             try {
                 val stream = parseStreamJson(run(track.originalUrl, common + listOf("--extractor-args", "youtube:player_client=$client")))
-                if (stream != null && (index == 1 || !stream.url.contains("c=TVHTML5"))) {
+                val finalStrategy = client == "android,web"
+                if (stream != null && (finalStrategy || !stream.url.contains("c=TVHTML5"))) {
                     withContext(Dispatchers.IO) { InputClassifier.validateStreamUrl(stream.url) }
-                    return stream
+                    return ResolvedStream(stream, finalStrategy)
                 }
             } catch (error: ExtractorError) { lastError = error }
         }
