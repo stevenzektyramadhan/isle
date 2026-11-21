@@ -71,9 +71,8 @@ class PlayerEngine(private val context: Context) {
                 finishReadyTiming(Timing.Outcome.ERROR)
                 val status = generateSequence(error.cause) { it.cause }
                     .filterIsInstance<HttpDataSource.InvalidResponseCodeException>().firstOrNull()?.responseCode
-                val track = recovery.retry(mediaGeneration, player.currentMediaItem?.mediaId, status)
-                if (track == null) coordinator.activationFailed(mediaGeneration)
-                else coordinator.retry(track, mediaGeneration)
+                val mediaId = player.currentMediaItem?.mediaId
+                coordinator.playerError(mediaGeneration, mediaId) { recovery.retry(mediaGeneration, mediaId, status) }
             }
         })
         scope.launch { coordinator.availability(extractor.isAvailable()) }

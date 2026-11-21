@@ -33,6 +33,10 @@ internal class PlaybackCoordinator(
     var generation = 0L
         private set
     private var installedGeneration = -1L
+    private var retainedInstalledGeneration: Long? = null
+    private var consumedErrorMediaId: String? = null
+    private data class Activation(val track: TrackItem, val origin: QueueManager.Origin)
+    private var pendingActivation: Activation? = null
     private var pendingInputGeneration: Long? = null
     private var pendingEndGeneration: Long? = null
     private val mutableState = MutableStateFlow(PlayerState())
@@ -51,7 +55,7 @@ internal class PlaybackCoordinator(
                     launchActivation(track, QueueManager.Origin.Manual, current)
                 }
             }
-            PlayerCommand.Stop -> { invalidate(); queue.stop(); playWhenReady = false; output.stop(); publish(false) }
+            PlayerCommand.Stop -> { invalidate(); queue.stop(); halt(null) }
             PlayerCommand.TogglePlayPause -> setPlaying(!playWhenReady)
             PlayerCommand.Play -> setPlaying(true)
             PlayerCommand.Pause -> setPlaying(false)
@@ -71,8 +75,12 @@ internal class PlaybackCoordinator(
     }
 
     private fun submit(input: String) {
+        val interrupted = pendingActivation
+        val retained = installedGeneration.takeIf { acceptsInstalled(it) }
         val pendingEnd = pendingEndGeneration
         val current = invalidate()
+        pendingActivation = interrupted
+        retainedInstalledGeneration = retained
         pendingInputGeneration = current
         pendingEndGeneration = pendingEnd
         queue.resetErrors()
@@ -93,6 +101,10 @@ internal class PlaybackCoordinator(
                 if (current == generation) {
                     pendingInputGeneration = null
                     if (intentVersion == submittedIntentVersion) playWhenReady = previousIntent
+                    if (interrupted != null && queue.current == interrupted.track) {
+                        launchActivation(interrupted.track, interrupted.origin, current)
+                        return@launch
+                    }
                     publish(false, error.message); prepareNext()
                     pendingEndGeneration?.let { endedGeneration ->
                         pendingEndGeneration = null
@@ -135,6 +147,10 @@ internal class PlaybackCoordinator(
     }
 
     private suspend fun activate(track: TrackItem, nextOrigin: QueueManager.Origin, current: Long, prepared: ResolvedStream? = null) {
+        installedGeneration = -1L
+        retainedInstalledGeneration = null
+        output.stop()
+        pendingActivation = Activation(track, nextOrigin)
         origin = nextOrigin
         publish(true)
         try {
@@ -144,6 +160,7 @@ internal class PlaybackCoordinator(
             installedGeneration = current
             output.install(track, stream, current)
             output.play(playWhenReady)
+            pendingActivation = null
             publish(false)
             prepareNext()
         } catch (_: ExtractorError) {
@@ -154,11 +171,11 @@ internal class PlaybackCoordinator(
     }
 
     fun ready(current: Long) {
-        if (current == installedGeneration && (current == generation || !state.value.isLoading)) queue.activationSucceeded()
+        if (acceptsInstalled(current)) queue.activationSucceeded()
     }
 
     fun ended(current: Long) {
-        if (current != installedGeneration) return
+        if (!acceptsInstalled(current)) return
         if (pendingInputGeneration != null) pendingEndGeneration = current
         else if (!state.value.isLoading) {
             installedGeneration = -1L
@@ -167,7 +184,8 @@ internal class PlaybackCoordinator(
     }
 
     fun activationFailed(current: Long) {
-        if (current != generation && (current != installedGeneration || state.value.isLoading)) return
+        if (!(current == generation && pendingActivation != null) && !acceptsInstalled(current)) return
+        pendingActivation = null
         queue.activationFailed()
         when (val activeOrigin = origin) {
             QueueManager.Origin.Manual -> halt("Playback failed")
@@ -175,10 +193,18 @@ internal class PlaybackCoordinator(
         }
     }
 
+    fun playerError(current: Long, mediaId: String?, recoveryTrack: () -> TrackItem?) {
+        if (!acceptsInstalled(current) || mediaId == null || mediaId == consumedErrorMediaId) return
+        consumedErrorMediaId = mediaId
+        val track = recoveryTrack()
+        if (track == null) activationFailed(current) else retry(track, current)
+    }
+
     fun retry(track: TrackItem, current: Long) {
-        if (current != installedGeneration || (current != generation && state.value.isLoading)) return
+        if (!acceptsInstalled(current)) return
         val retryGeneration = generation
         job?.cancel()
+        pendingActivation = Activation(track, origin)
         publish(true, "Retrying playback…")
         job = scope.launch {
             try {
@@ -187,6 +213,7 @@ internal class PlaybackCoordinator(
                 installedGeneration = retryGeneration
                 output.install(track, stream, retryGeneration)
                 output.play(playWhenReady)
+                pendingActivation = null
                 publish(false)
             } catch (_: ExtractorError) { if (retryGeneration == generation) activationFailed(retryGeneration) }
         }
@@ -196,7 +223,7 @@ internal class PlaybackCoordinator(
     fun playIntentChanged(ready: Boolean) { intentVersion++; playWhenReady = ready }
     fun availability(available: Boolean) { mutableState.update { it.copy(ytdlpAvailable = available, statusMessage = if (available) it.statusMessage else "yt-dlp is unavailable") } }
     fun noteStatus(message: String) { mutableState.update { if (!it.isLoading && it.statusMessage == null) it.copy(statusMessage = message) else it } }
-    fun unavailable(message: String) { invalidate(); playWhenReady = false; output.play(false); publish(false, message) }
+    fun unavailable(message: String) { invalidate(); halt(message) }
 
     private fun setPlaying(ready: Boolean) {
         intentVersion++
@@ -222,8 +249,9 @@ internal class PlaybackCoordinator(
     }
 
     private fun invalidatePreparation() { prefetch?.cancel(); preparation.invalidate() }
-    private fun invalidate(): Long { generation++; pendingInputGeneration = null; pendingEndGeneration = null; job?.cancel(); invalidatePreparation(); return generation }
-    private fun halt(message: String?) { playWhenReady = false; output.stop(); publish(false, message) }
+    private fun acceptsInstalled(current: Long) = current >= 0 && current == installedGeneration && (current == generation || current == retainedInstalledGeneration)
+    private fun invalidate(): Long { generation++; retainedInstalledGeneration = null; pendingActivation = null; pendingInputGeneration = null; pendingEndGeneration = null; job?.cancel(); invalidatePreparation(); return generation }
+    private fun halt(message: String?) { installedGeneration = -1L; retainedInstalledGeneration = null; pendingActivation = null; playWhenReady = false; output.stop(); publish(false, message) }
     private fun publish(loading: Boolean, message: String? = null) {
         mutableState.update { it.copy(currentTrack = queue.current, queue = Collections.unmodifiableList(queue.queue), history = Collections.unmodifiableList(queue.history), autoplayAnchor = queue.anchor, autoplayFetched = queue.autoplayFetched, isLoading = loading, statusMessage = message) }
     }

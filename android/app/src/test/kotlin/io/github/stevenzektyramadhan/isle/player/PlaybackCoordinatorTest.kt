@@ -29,6 +29,208 @@ class PlaybackCoordinatorTest {
         }
     }
 
+    @Test fun replacementStopsOutgoingOutputBeforeStreamResolution() = runBlocking {
+        for (command in listOf(PlayerCommand.Next, PlayerCommand.Previous, PlayerCommand.SubmitInput("song"))) {
+            val started = CompletableDeferred<Unit>()
+            val gate = CompletableDeferred<Unit>()
+            var block = false
+            val output = Output()
+            val coordinator = PlaybackCoordinator(repository { if (block) { started.complete(Unit); gate.await() } }, this, output)
+            try {
+                coordinator.dispatch(PlayerCommand.SubmitInput("https://www.youtube.com/playlist?list=test"))
+                coordinator.settled()
+                if (command == PlayerCommand.Previous) {
+                    coordinator.dispatch(PlayerCommand.Next)
+                    coordinator.settled()
+                }
+                val outgoing = coordinator.generation
+                block = true
+                coordinator.dispatch(command)
+                started.await()
+                assertFalse("Outgoing output must stop during $command", output.playing)
+                coordinator.ended(outgoing)
+                coordinator.activationFailed(outgoing)
+                assertTrue(coordinator.state.value.isLoading)
+                gate.complete(Unit)
+                coordinator.settled()
+                assertTrue(output.playing)
+            } finally { coordinator.release() }
+        }
+    }
+
+    @Test fun retiredInstallationsCannotChangeStoppedOrUnavailableSessions() = runBlocking {
+        for (retirement in listOf("stop", "halt", "unavailable")) {
+            for (callback in listOf("error", "end", "ready")) {
+                val output = Output()
+                val coordinator = PlaybackCoordinator(repository(), this, output)
+                try {
+                    coordinator.dispatch(PlayerCommand.SubmitInput("https://www.youtube.com/playlist?list=test"))
+                    coordinator.settled()
+                    val installed = coordinator.generation
+                    when (retirement) {
+                        "stop" -> coordinator.dispatch(PlayerCommand.Stop)
+                        "halt" -> coordinator.activationFailed(installed)
+                        else -> coordinator.unavailable("disconnected")
+                    }
+                    val stopped = coordinator.state.value
+                    when (callback) {
+                        "error" -> coordinator.activationFailed(installed)
+                        "end" -> coordinator.ended(installed)
+                        else -> coordinator.ready(installed)
+                    }
+                    coroutineContext[Job]!!.children.toList().forEach { it.join() }
+                    assertEquals("$retirement / $callback", stopped, coordinator.state.value)
+                    assertFalse(output.playing)
+                    assertEquals(listOf("a"), output.installed)
+                } finally { coordinator.release() }
+            }
+        }
+    }
+
+    @Test fun duplicateInstalledErrorCannotAbort403RecoveryOrSpendFailureBudget() = runBlocking {
+        for (recoveryFails in listOf(false, true)) {
+            val retryStarted = CompletableDeferred<Unit>()
+            val retryResult = CompletableDeferred<Unit>()
+            var resolutions = 0
+            var failFollowing = false
+            val source = repository {
+                resolutions++
+                if (resolutions == 3) { retryStarted.complete(Unit); retryResult.await() }
+                if (failFollowing) throw ExtractorError.Failed
+            }
+            val recovery = PlaybackRecovery()
+            val installs = mutableListOf<String>()
+            var mediaId = ""
+            var installedGeneration = -1L
+            val output = object : PlaybackOutput {
+                override suspend fun connect() = Unit
+                override fun install(track: TrackItem, stream: ResolvedStream, generation: Long) {
+                    installs.add(track.id)
+                    mediaId = installs.size.toString()
+                    installedGeneration = generation
+                    recovery.start(track, generation, mediaId, stream.finalStrategy)
+                }
+                override fun play(ready: Boolean) = Unit
+                override fun stop() = Unit
+            }
+            val coordinator = PlaybackCoordinator(source, this, output)
+            try {
+                coordinator.dispatch(PlayerCommand.SubmitInput("https://www.youtube.com/playlist?list=test"))
+                coordinator.settled()
+                coordinator.ended(coordinator.generation)
+                coordinator.settled()
+                val failedMediaId = mediaId
+                fun deliver403() {
+                    coordinator.playerError(installedGeneration, failedMediaId) {
+                        recovery.retry(installedGeneration, failedMediaId, 403)
+                    }
+                }
+                deliver403()
+                retryStarted.await()
+                deliver403()
+                assertEquals("b", coordinator.state.value.currentTrack?.id)
+                assertEquals(listOf("c", "d", "e"), coordinator.state.value.queue.map { it.id })
+                assertTrue(coordinator.state.value.isLoading)
+                failFollowing = recoveryFails
+                retryResult.complete(Unit)
+                coordinator.settled()
+                if (recoveryFails) {
+                    assertEquals(listOf("a", "b"), installs)
+                    assertEquals(listOf("e"), coordinator.state.value.queue.map { it.id })
+                } else {
+                    assertEquals(listOf("a", "b", "b"), installs)
+                    failFollowing = true
+                    coordinator.playerError(installedGeneration, mediaId) { recovery.retry(installedGeneration, mediaId, 403) }
+                    coordinator.settled()
+                    assertEquals(listOf("e"), coordinator.state.value.queue.map { it.id })
+                }
+                assertEquals("Playback stopped: repeated errors", coordinator.state.value.statusMessage)
+            } finally { coordinator.release() }
+        }
+    }
+
+    @Test fun failedInputResumesInterruptedActivationWithItsPlaybackIntentAndOrigin() = runBlocking {
+        for (navigation in listOf("next", "previous", "input", "automatic")) {
+            val started = CompletableDeferred<Unit>()
+            val gate = CompletableDeferred<Unit>()
+            var resolutions = 0
+            val output = Output()
+            val coordinator = PlaybackCoordinator(repository {
+                resolutions++
+                if (resolutions == if (navigation == "previous") 3 else 2) {
+                    started.complete(Unit)
+                    gate.await()
+                }
+            }, this, output)
+            try {
+                coordinator.dispatch(PlayerCommand.SubmitInput("https://www.youtube.com/playlist?list=test"))
+                coordinator.settled()
+                when (navigation) {
+                    "previous" -> {
+                        coordinator.dispatch(PlayerCommand.Next)
+                        coordinator.settled()
+                        coordinator.dispatch(PlayerCommand.Previous)
+                    }
+                    "input" -> coordinator.dispatch(PlayerCommand.SubmitInput("song"))
+                    "automatic" -> coordinator.ended(coordinator.generation)
+                    else -> coordinator.dispatch(PlayerCommand.Next)
+                }
+                started.await()
+                coordinator.dispatch(PlayerCommand.Pause)
+                coordinator.dispatch(PlayerCommand.SubmitInput("bad"))
+                coroutineContext[Job]!!.children.toList().forEach { it.join() }
+                coordinator.settled()
+                assertEquals(navigation, if (navigation == "previous") listOf("a", "b", "a") else if (navigation == "input") listOf("a", "z") else listOf("a", "b"), output.installed)
+                assertFalse(output.playing)
+                assertFalse(coordinator.state.value.isLoading)
+                coordinator.activationFailed(coordinator.generation)
+                coordinator.settled()
+                assertEquals(navigation, if (navigation == "automatic") "c" else if (navigation == "previous") "a" else if (navigation == "input") "z" else "b", coordinator.state.value.currentTrack?.id)
+                assertEquals(navigation, navigation == "automatic", coordinator.state.value.statusMessage == null)
+            } finally { coordinator.release() }
+        }
+    }
+
+    @Test fun obsoleteFailedSubmissionCannotRestoreActivationAfterStopOrNavigation() = runBlocking {
+        for (command in listOf(PlayerCommand.Stop, PlayerCommand.Next, PlayerCommand.Previous)) {
+            val activationStarted = CompletableDeferred<Unit>()
+            val lookupStarted = CompletableDeferred<Unit>()
+            val lookupResult = CompletableDeferred<String>()
+            val activationGate = CompletableDeferred<Unit>()
+            var resolutions = 0
+            val source = ExtractorRepository { target, args ->
+                when {
+                    target == "ytsearch3:pending" -> withContext(NonCancellable) {
+                        lookupStarted.complete(Unit)
+                        lookupResult.await()
+                    }
+                    "-j" in args -> {
+                        resolutions++
+                        if (resolutions == 2) { activationStarted.complete(Unit); activationGate.await() }
+                        """{"url":"https://8.8.8.8/stream"}"""
+                    }
+                    else -> "a:::Alpha:::https://www.youtube.com/watch?v=a\nb:::Beta:::https://www.youtube.com/watch?v=b\nc:::Gamma:::https://www.youtube.com/watch?v=c"
+                }
+            }
+            val output = Output()
+            val coordinator = PlaybackCoordinator(source, this, output)
+            try {
+                coordinator.dispatch(PlayerCommand.SubmitInput("https://www.youtube.com/playlist?list=test"))
+                coordinator.settled()
+                coordinator.dispatch(PlayerCommand.Next)
+                activationStarted.await()
+                coordinator.dispatch(PlayerCommand.SubmitInput("pending"))
+                lookupStarted.await()
+                coordinator.dispatch(command)
+                coordinator.settled()
+                lookupResult.completeExceptionally(ExtractorError.Failed)
+                coroutineContext[Job]!!.children.toList().forEach { it.join() }
+                assertEquals(if (command == PlayerCommand.Stop) listOf("a") else if (command == PlayerCommand.Next) listOf("a", "c") else listOf("a", "a"), output.installed)
+                assertEquals(if (command == PlayerCommand.Stop) null else if (command == PlayerCommand.Next) "c" else "a", coordinator.state.value.currentTrack?.id)
+            } finally { coordinator.release() }
+        }
+    }
+
     @Test fun failedInputPreservesQueueHistoryAndPlayingTrack() = runBlocking {
         val output = Output()
         val coordinator = PlaybackCoordinator(repository(), this, output)
