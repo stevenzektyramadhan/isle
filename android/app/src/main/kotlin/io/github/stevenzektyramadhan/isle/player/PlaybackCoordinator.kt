@@ -1,7 +1,9 @@
 package io.github.stevenzektyramadhan.isle.player
 
 import io.github.stevenzektyramadhan.isle.data.ExtractorRepository
+import io.github.stevenzektyramadhan.isle.Timing
 import io.github.stevenzektyramadhan.isle.data.ResolvedStream
+import io.github.stevenzektyramadhan.isle.data.settings.SettingsStore
 import io.github.stevenzektyramadhan.isle.domain.ExtractorError
 import io.github.stevenzektyramadhan.isle.domain.QueueManager
 import io.github.stevenzektyramadhan.isle.model.*
@@ -14,6 +16,8 @@ internal interface PlaybackOutput {
     fun install(track: TrackItem, stream: ResolvedStream, generation: Long)
     fun play(ready: Boolean)
     fun stop()
+    fun seekTo(seconds: Long) = Unit
+    fun setVolume(volume: Float) = Unit
 }
 
 /** Main-thread confined orchestration shared by app commands and media-session commands. */
@@ -21,6 +25,8 @@ internal class PlaybackCoordinator(
     private val extractor: ExtractorRepository,
     private val scope: CoroutineScope,
     private val output: PlaybackOutput,
+    settings: SettingsStore? = null,
+    private val timing: Timing = Timing.android,
     nowMillis: () -> Long = { System.nanoTime() / 1_000_000 },
 ) {
     private val queue = QueueManager()
@@ -41,6 +47,13 @@ internal class PlaybackCoordinator(
     private var pendingEndGeneration: Long? = null
     private val mutableState = MutableStateFlow(PlayerState())
     val state = mutableState.asStateFlow()
+    private val preferences = settings?.let { store ->
+        PlayerPreferences(store, scope, object : PlayerPreferences.Target {
+            override fun restoreVolume(volume: Float) = applyVolume(volume)
+            override fun restoreAutoplay(enabled: Boolean) = applyAutoplay(enabled)
+            override fun preferencesFailed(message: String) { mutableState.update { it.copy(preferencesError = message) } }
+        })
+    }
 
     fun dispatch(command: PlayerCommand) {
         when (command) {
@@ -65,13 +78,38 @@ internal class PlaybackCoordinator(
                 else publish(state.value.isLoading)
             }
             PlayerCommand.ToggleAutoplay -> {
-                mutableState.update { it.copy(autoplayEnabled = !it.autoplayEnabled) }
-                // A pending related lookup must not repopulate a disabled autoplay session.
-                if (!state.value.autoplayEnabled && queue.current == null && state.value.isLoading) {
-                    invalidate(); halt("Autoplay disabled")
+                applyAutoplay(!state.value.autoplayEnabled)
+                preferences?.autoplay(state.value.autoplayEnabled)
+            }
+            is PlayerCommand.SetVolume -> if (command.volume.isFinite()) {
+                applyVolume(command.volume.coerceIn(0f, 1f))
+                preferences?.volume(state.value.volume)
+            }
+            is PlayerCommand.SeekTo -> {
+                val duration = state.value.durationSecs ?: state.value.currentTrack?.durationSecs
+                if (acceptsInstalled(installedGeneration) && duration != null && duration > 0) {
+                    val seconds = command.seconds.coerceIn(0, duration)
+                    output.seekTo(seconds)
+                    mutableState.update { it.copy(elapsedSecs = seconds) }
                 }
             }
         }
+    }
+
+    private fun applyVolume(volume: Float) {
+        mutableState.update { it.copy(volume = volume) }
+        output.setVolume(volume)
+    }
+
+    private fun applyAutoplay(enabled: Boolean) {
+        mutableState.update { it.copy(autoplayEnabled = enabled) }
+        if (!enabled && queue.current == null && state.value.isLoading) { invalidate(); halt("Autoplay disabled") }
+    }
+
+    fun progress(positionSecs: Long, durationSecs: Long?) {
+        if (!acceptsInstalled(installedGeneration)) return
+        val duration = durationSecs?.takeIf { it > 0 } ?: state.value.currentTrack?.durationSecs?.takeIf { it > 0 }
+        mutableState.update { it.copy(elapsedSecs = positionSecs.coerceIn(0, duration ?: Long.MAX_VALUE), durationSecs = duration) }
     }
 
     private fun submit(input: String) {
@@ -116,7 +154,11 @@ internal class PlaybackCoordinator(
     }
 
     private fun advance(nextOrigin: QueueManager.Origin) {
-        val prepared = queue.queue.firstOrNull()?.let(preparation::take)
+        val prepared = queue.queue.firstOrNull()?.let { track ->
+            preparation.take(track).also {
+                timing.prefetch(if (it == null) Timing.PrefetchOutcome.MISS else Timing.PrefetchOutcome.HIT)
+            }
+        }
         val current = invalidate()
         if (nextOrigin == QueueManager.Origin.Manual) playWhenReady = true
         val action = queue.advance(nextOrigin, state.value.autoplayEnabled)
@@ -129,7 +171,7 @@ internal class PlaybackCoordinator(
         when (action) {
             is QueueManager.Advance.Play -> activate(action.track, action.origin, current, prepared)
             is QueueManager.Advance.Fetch -> {
-                val result = try { QueueManager.Related.Tracks(extractor.fetchRelated(action.anchor)) }
+                val result = try { QueueManager.Related.Tracks(timing.measure(Timing.Stage.RADIO_LOOKUP) { extractor.fetchRelated(action.anchor) }) }
                 catch (_: ExtractorError.NoResults) { QueueManager.Related.NoResults }
                 catch (_: ExtractorError) { QueueManager.Related.Failure }
                 if (current != generation) return
@@ -150,6 +192,7 @@ internal class PlaybackCoordinator(
         installedGeneration = -1L
         retainedInstalledGeneration = null
         output.stop()
+        mutableState.update { it.copy(elapsedSecs = 0, durationSecs = track.durationSecs?.takeIf { seconds -> seconds > 0 }) }
         pendingActivation = Activation(track, nextOrigin)
         origin = nextOrigin
         publish(true)
@@ -244,16 +287,16 @@ internal class PlaybackCoordinator(
         prefetch?.cancel()
         prefetch = scope.launch {
             try { preparation.complete(attempt, extractor.resolveStream(attempt.track)) }
-            catch (_: ExtractorError) { preparation.fail(attempt) }
+            catch (_: ExtractorError) { preparation.fail(attempt); timing.prefetch(Timing.PrefetchOutcome.FAILURE) }
         }
     }
 
     private fun invalidatePreparation() { prefetch?.cancel(); preparation.invalidate() }
     private fun acceptsInstalled(current: Long) = current >= 0 && current == installedGeneration && (current == generation || current == retainedInstalledGeneration)
     private fun invalidate(): Long { generation++; retainedInstalledGeneration = null; pendingActivation = null; pendingInputGeneration = null; pendingEndGeneration = null; job?.cancel(); invalidatePreparation(); return generation }
-    private fun halt(message: String?) { installedGeneration = -1L; retainedInstalledGeneration = null; pendingActivation = null; playWhenReady = false; output.stop(); publish(false, message) }
+    private fun halt(message: String?) { installedGeneration = -1L; retainedInstalledGeneration = null; pendingActivation = null; playWhenReady = false; output.stop(); mutableState.update { it.copy(isPlaying = false, elapsedSecs = 0, durationSecs = null) }; publish(false, message) }
     private fun publish(loading: Boolean, message: String? = null) {
         mutableState.update { it.copy(currentTrack = queue.current, queue = Collections.unmodifiableList(queue.queue), history = Collections.unmodifiableList(queue.history), autoplayAnchor = queue.anchor, autoplayFetched = queue.autoplayFetched, isLoading = loading, statusMessage = message) }
     }
-    fun release() { invalidate() }
+    fun release() { invalidate(); preferences?.close() }
 }

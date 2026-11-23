@@ -13,6 +13,10 @@ data class PlayerState(
     val autoplayEnabled: Boolean = true,
     val autoplayAnchor: TrackItem? = null,
     val autoplayFetched: Boolean = false,
+    val volume: Float = 1f,
+    val elapsedSecs: Long = 0,
+    val durationSecs: Long? = null,
+    val preferencesError: String? = null,
 )
 
 sealed interface PlayerCommand {
@@ -25,4 +29,6 @@ sealed interface PlayerCommand {
     data object Pause : PlayerCommand
     data object ClearQueue : PlayerCommand
     data object ToggleAutoplay : PlayerCommand
+    data class SetVolume(val volume: Float) : PlayerCommand
+    data class SeekTo(val seconds: Long) : PlayerCommand
 }

@@ -1,12 +1,35 @@
 package io.github.stevenzektyramadhan.isle.player
 
 import io.github.stevenzektyramadhan.isle.model.TrackItem
+import io.github.stevenzektyramadhan.isle.data.ExtractorRepository
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
 
 class PlaybackRecoveryTest {
     private val track = TrackItem("one", "One", null, "https://example.com/one", null)
+
+    @Test fun android403UsesAlternateAndAlternate403EndsRecovery() = runBlocking {
+        val clients = mutableListOf<String>()
+        val repository = ExtractorRepository { _, args ->
+            val client = args.last().substringAfter("player_client=")
+            clients.add(client)
+            """{"url":"https://8.8.8.8/$client"}"""
+        }
+        val recovery = PlaybackRecovery()
+        val first = repository.resolveStream(track)
+        recovery.start(track, 1, "first", first.finalStrategy)
+        val retry = recovery.retry(1, "first", 403)
+        assertEquals(track, retry)
+        assertNull(recovery.retry(1, "first", 403))
+        val alternate = repository.resolveStream(requireNotNull(retry), finalOnly = true)
+        recovery.start(track, 1, "alternate", alternate.finalStrategy)
+        assertNull(recovery.retry(1, "first", 403))
+        assertNull(recovery.retry(1, "alternate", 403))
+        assertEquals("https://8.8.8.8/visionos,default", alternate.stream.url)
+        assertEquals(listOf("android,web", "visionos,default"), clients)
+    }
 
     @Test fun initial403RetriesTheSameTrackOnlyOnce() {
         val recovery = PlaybackRecovery()

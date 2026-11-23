@@ -1,6 +1,7 @@
 package io.github.stevenzektyramadhan.isle.player
 
 import io.github.stevenzektyramadhan.isle.data.ExtractorRepository
+import io.github.stevenzektyramadhan.isle.Timing
 import io.github.stevenzektyramadhan.isle.data.ResolvedStream
 import io.github.stevenzektyramadhan.isle.domain.ExtractorError
 import io.github.stevenzektyramadhan.isle.model.*
@@ -10,14 +11,20 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PlaybackCoordinatorTest {
+    private fun PlaybackCoordinator(extractor: ExtractorRepository, scope: CoroutineScope, output: PlaybackOutput, nowMillis: () -> Long = { System.nanoTime() / 1_000_000 }) =
+        io.github.stevenzektyramadhan.isle.player.PlaybackCoordinator(extractor, scope, output, timing = Timing(nowMillis, {}), nowMillis = nowMillis)
     private suspend fun PlaybackCoordinator.settled() = withTimeout(5_000) { state.first { !it.isLoading } }
     private class Output : PlaybackOutput {
         val installed = mutableListOf<String>()
         var playing = false
+        val seeks = mutableListOf<Long>()
+        var appliedVolume = 1f
         override suspend fun connect() = Unit
         override fun install(track: TrackItem, stream: ResolvedStream, generation: Long) { installed.add(track.id) }
         override fun play(ready: Boolean) { playing = ready }
         override fun stop() { playing = false }
+        override fun seekTo(seconds: Long) { seeks.add(seconds) }
+        override fun setVolume(volume: Float) { appliedVolume = volume }
     }
 
     private fun repository(stream: suspend () -> Unit = {}) = ExtractorRepository { target, args ->
@@ -27,6 +34,44 @@ class PlaybackCoordinatorTest {
             "--playlist-end" in args -> "a:::Alpha:::a\nb:::Beta:::b\nc:::Gamma:::c\nd:::Delta:::d\ne:::Epsilon:::e"
             else -> "z:::Zeta:::Artist:::https://www.youtube.com/watch?v=z:::10"
         }
+    }
+
+    @Test fun seekClampsToDurationAndStoppedPlaybackRejectsProgressAndSeek() = runBlocking {
+        val output = Output()
+        val coordinator = PlaybackCoordinator(repository(), this, output)
+        try {
+            coordinator.dispatch(PlayerCommand.SeekTo(5))
+            assertTrue(output.seeks.isEmpty())
+            coordinator.dispatch(PlayerCommand.SubmitInput("song"))
+            coordinator.settled()
+            coordinator.progress(3, 12)
+            assertEquals(3L, coordinator.state.value.elapsedSecs)
+            assertEquals(12L, coordinator.state.value.durationSecs)
+            coordinator.dispatch(PlayerCommand.SeekTo(Long.MAX_VALUE))
+            assertEquals(12L, coordinator.state.value.elapsedSecs)
+            coordinator.dispatch(PlayerCommand.SeekTo(-5))
+            assertEquals(listOf(12L, 0L), output.seeks)
+            coordinator.progress(20, 12)
+            assertEquals(12L, coordinator.state.value.elapsedSecs)
+            coordinator.dispatch(PlayerCommand.Stop)
+            coordinator.progress(8, 12)
+            coordinator.dispatch(PlayerCommand.SeekTo(4))
+            assertEquals(listOf(12L, 0L), output.seeks)
+            assertEquals(0L, coordinator.state.value.elapsedSecs)
+            assertNull(coordinator.state.value.durationSecs)
+        } finally { coordinator.release() }
+    }
+
+    @Test fun volumeClampsFiniteCommandsAndRejectsNonFiniteValues() = runBlocking {
+        val output = Output()
+        val coordinator = PlaybackCoordinator(repository(), this, output)
+        try {
+            for ((input, expected) in listOf(2f to 1f, -1f to 0f, .4f to .4f, Float.NaN to .4f, Float.POSITIVE_INFINITY to .4f)) {
+                coordinator.dispatch(PlayerCommand.SetVolume(input))
+                assertEquals(expected, coordinator.state.value.volume)
+                assertEquals(expected, output.appliedVolume)
+            }
+        } finally { coordinator.release() }
     }
 
     @Test fun replacementStopsOutgoingOutputBeforeStreamResolution() = runBlocking {
@@ -454,6 +499,51 @@ class PlaybackCoordinatorTest {
             assertEquals(listOf("a", "b"), output.installed)
             assertEquals(expectedResolutions, resolutions)
             coordinator.release()
+        }
+    }
+
+    @Test fun prefetchMetricsDistinguishHitFromMissWithoutTrackData() = runBlocking {
+        for ((age, outcome) in listOf(59_999L to "hit", 60_000L to "miss")) {
+            var now = 0L
+            val lines = mutableListOf<String>()
+            val completed = CompletableDeferred<Unit>()
+            var resolutions = 0
+            val source = repository { if (++resolutions == 2) completed.complete(Unit) }
+            val coordinator = PlaybackCoordinator(source, this, Output(), timing = Timing({ now }, lines::add)) { now }
+            try {
+                coordinator.dispatch(PlayerCommand.SubmitInput("https://www.youtube.com/playlist?list=test"))
+                coordinator.settled()
+                coordinator.playingChanged(true)
+                withTimeout(5_000) { completed.await() }
+                coroutineContext[Job]!!.children.toList().forEach { withTimeout(5_000) { it.join() } }
+                coordinator.playingChanged(false)
+                now = age
+                coordinator.dispatch(PlayerCommand.Next)
+                coordinator.settled()
+                assertEquals(listOf("event=prefetch outcome=$outcome"), lines)
+            } finally { coordinator.release() }
+        }
+    }
+
+    @Test fun radioLookupReportsOutcomeAndDurationWithoutInputData() = runBlocking {
+        for ((response, outcome) in listOf("b:::Beta:::Artist:::https://www.youtube.com/watch?v=b:::10" to "success", "" to "no_results")) {
+            var now = 10L
+            val lines = mutableListOf<String>()
+            val source = ExtractorRepository { _, args ->
+                when {
+                    "-j" in args -> """{"url":"https://8.8.8.8/stream"}"""
+                    "-I" in args -> { now = 42L; response }
+                    else -> "a:::Alpha:::Artist:::https://www.youtube.com/watch?v=a:::10"
+                }
+            }
+            val coordinator = PlaybackCoordinator(source, this, Output(), timing = Timing({ now }, lines::add))
+            try {
+                coordinator.dispatch(PlayerCommand.SubmitInput("private song"))
+                coordinator.settled()
+                coordinator.ended(coordinator.generation)
+                coordinator.settled()
+                assertEquals(listOf("stage=radio_lookup outcome=$outcome elapsed_ms=32"), lines)
+            } finally { coordinator.release() }
         }
     }
 }

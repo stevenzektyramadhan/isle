@@ -20,6 +20,7 @@ import com.google.common.util.concurrent.ListenableFuture
 import io.github.stevenzektyramadhan.isle.Timing
 import io.github.stevenzektyramadhan.isle.data.ExtractorRepository
 import io.github.stevenzektyramadhan.isle.data.ResolvedStream
+import io.github.stevenzektyramadhan.isle.data.settings.DataStoreSettings
 import io.github.stevenzektyramadhan.isle.model.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.StateFlow
@@ -27,10 +28,12 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 @androidx.annotation.OptIn(UnstableApi::class)
-class PlayerEngine(private val context: Context) {
+class PlayerEngine internal constructor(private val context: Context) {
+    init { check(Looper.myLooper() == Looper.getMainLooper()) }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val extractor = ExtractorRepository(context, scope)
     private val player = ExoPlayer.Builder(context)
+        .setLooper(Looper.getMainLooper())
         .setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(), true)
         .setHandleAudioBecomingNoisy(true)
         .build()
@@ -41,6 +44,7 @@ class PlayerEngine(private val context: Context) {
     private var mediaGeneration = 0L
     private var mediaSequence = 0L
     private var readyStarted: Long? = null
+    private var progressJob: Job? = null
     private val recovery = PlaybackRecovery()
     private val coordinator: PlaybackCoordinator = PlaybackCoordinator(extractor, scope, object : PlaybackOutput {
         override suspend fun connect() {
@@ -50,19 +54,37 @@ class PlayerEngine(private val context: Context) {
             }
         }
         override fun install(track: TrackItem, stream: ResolvedStream, generation: Long) = installStream(track, stream, generation)
-        override fun play(ready: Boolean) { player.playWhenReady = ready }
-        override fun stop() { finishReadyTiming(Timing.Outcome.CANCELLED); player.stop(); player.clearMediaItems() }
-    })
+        override fun play(ready: Boolean) { android.util.Log.i("IsleTrace", "output play=$ready"); player.playWhenReady = ready }
+        override fun stop() { android.util.Log.i("IsleTrace", "output stop"); finishReadyTiming(Timing.Outcome.CANCELLED); player.stop(); player.clearMediaItems() }
+        override fun seekTo(seconds: Long) { player.seekTo(seconds.coerceAtMost(Long.MAX_VALUE / 1000) * 1000) }
+        override fun setVolume(volume: Float) { player.volume = volume }
+    }, settings = DataStoreSettings(context))
     val state: StateFlow<PlayerState> = coordinator.state
-    fun noteStatus(message: String) = coordinator.noteStatus(message)
+    fun noteStatus(message: String) {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        coordinator.noteStatus(message)
+    }
 
     init {
         player.addListener(object : Player.Listener {
-            override fun onIsPlayingChanged(isPlaying: Boolean) { coordinator.playingChanged(isPlaying) }
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                coordinator.playingChanged(isPlaying)
+                progressJob?.cancel()
+                updateProgress()
+                if (isPlaying) progressJob = scope.launch {
+                    while (isActive) { delay(500); updateProgress() }
+                }
+            }
+            override fun onEvents(player: Player, events: Player.Events) { updateProgress() }
+            override fun onVolumeChanged(volume: Float) {
+                if (volume != state.value.volume) dispatch(PlayerCommand.SetVolume(volume))
+            }
             override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                android.util.Log.i("IsleTrace", "intent=$playWhenReady reason=$reason")
                 if (reason != Player.PLAY_WHEN_READY_CHANGE_REASON_USER_REQUEST) coordinator.playIntentChanged(playWhenReady)
             }
             override fun onPlaybackStateChanged(playbackState: Int) {
+                android.util.Log.i("IsleTrace", "state=$playbackState")
                 if (playbackState == Player.STATE_READY) { finishReadyTiming(Timing.Outcome.SUCCESS); recovery.ready(player.currentMediaItem?.mediaId); coordinator.ready(mediaGeneration) }
                 if (playbackState == Player.STATE_ENDED) coordinator.ended(mediaGeneration)
             }
@@ -78,7 +100,12 @@ class PlayerEngine(private val context: Context) {
         scope.launch { coordinator.availability(extractor.isAvailable()) }
     }
 
+    private fun updateProgress() {
+        coordinator.progress(player.currentPosition / 1000, player.duration.takeIf { it != C.TIME_UNSET && it > 0 }?.div(1000))
+    }
+
     fun dispatch(command: PlayerCommand) {
+        android.util.Log.i("IsleTrace", "command=${command::class.simpleName}")
         check(Looper.myLooper() == Looper.getMainLooper())
         coordinator.dispatch(command)
         if (command == PlayerCommand.Stop) disconnect()
@@ -139,6 +166,7 @@ class PlayerEngine(private val context: Context) {
     }
 
     fun foregroundStartFailed() {
+        check(Looper.myLooper() == Looper.getMainLooper())
         coordinator.unavailable("Background playback unavailable; open Isle and try again")
     }
 
