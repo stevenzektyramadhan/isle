@@ -2,3 +2,7 @@
 build/
 local.properties
 app/build/
+*.jks
+*.keystore
+*.p12
+*.pfx
