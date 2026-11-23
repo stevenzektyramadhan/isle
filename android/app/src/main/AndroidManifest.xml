@@ -3,7 +3,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <application android:name=".IsleApp" android:label="Isle" android:extractNativeLibs="true" android:usesCleartextTraffic="true">
+    <application android:name=".IsleApp" android:label="Isle" android:icon="@mipmap/ic_launcher" android:extractNativeLibs="true" android:usesCleartextTraffic="true">
         <activity android:name=".ui.MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
