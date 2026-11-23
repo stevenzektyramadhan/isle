@@ -8,10 +8,10 @@ import io.github.stevenzektyramadhan.isle.IsleApp
 import io.github.stevenzektyramadhan.isle.domain.*
 import io.github.stevenzektyramadhan.isle.model.*
 import io.github.stevenzektyramadhan.isle.update.YtDlpUpdater
+import io.github.stevenzektyramadhan.isle.update.YtDlpExecutionGate
+import io.github.stevenzektyramadhan.isle.data.extractor.SpotifyResolver
 import java.net.URI
 import java.util.UUID
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.*
 
 private const val SEARCH_FORMAT = "%(id)s:::%(title)s:::%(uploader)s:::%(url)s:::%(duration)s"
@@ -19,25 +19,34 @@ private const val METADATA_FORMAT = "%(id)s:::%(title)s:::%(uploader)s:::%(webpa
 private const val PLAYLIST_FORMAT = "%(id)s:::%(title)s:::%(url)s"
 private const val STREAM_FORMAT = "ba[ext=m4a][protocol^=http]/ba[ext=mp3][protocol^=http]/ba[acodec^=vorbis][protocol^=http]/ba[protocol^=http]/b[protocol^=http]"
 
-data class ResolvedStream(val stream: StreamInfo, val finalStrategy: Boolean)
+enum class StreamStrategy(val clients: String) {
+    ANDROID_WEB("android,web"),
+    VISIONOS_DEFAULT("visionos,default"),
+}
+
+data class ResolvedStream(val stream: StreamInfo, val strategy: StreamStrategy) {
+    val finalStrategy: Boolean get() = strategy == StreamStrategy.VISIONOS_DEFAULT
+}
 
 class ExtractorRepository private constructor(
     private val ready: Deferred<Unit>,
     private val availability: () -> Boolean,
     private val invocation: (suspend (String, List<String>) -> String)?,
     private val timing: Timing,
+    private val spotify: SpotifyResolver = SpotifyResolver(),
 ) {
     private constructor(context: Context, scope: CoroutineScope, available: BooleanArray) : this(scope.async(Dispatchers.IO) {
         try {
-            YoutubeDL.init(context.applicationContext)
+            YtDlpExecutionGate.withUpdate { YoutubeDL.init(context.applicationContext) }
             available[0] = true
             if (!YtDlpUpdater(context).check()) scope.launch { (context.applicationContext as IsleApp).playerEngine.noteStatus("yt-dlp update failed") }
+            YtDlpExecutionGate.enableManualUpdates()
         } catch (error: CancellationException) { throw error } catch (_: Exception) { }
     }, { available[0] }, null, Timing.android)
 
     constructor(context: Context, scope: CoroutineScope) : this(context, scope, booleanArrayOf(false))
 
-    internal constructor(timing: Timing = Timing({ System.nanoTime() / 1_000_000 }, {}), invocation: suspend (String, List<String>) -> String) : this(CompletableDeferred(Unit), { true }, invocation, timing)
+    internal constructor(timing: Timing = Timing({ System.nanoTime() / 1_000_000 }, {}), spotify: SpotifyResolver = SpotifyResolver(), invocation: suspend (String, List<String>) -> String) : this(CompletableDeferred(Unit), { true }, invocation, timing, spotify)
 
     suspend fun isAvailable(): Boolean { ready.await(); return availability() }
 
@@ -48,7 +57,9 @@ class ExtractorRepository private constructor(
             is InputKind.SearchQuery -> listOfNotNull(run("ytsearch3:${kind.value}", listOf("--flat-playlist", "--match-filter", "live_status!=is_live", "--print", SEARCH_FORMAT)).lineSequence().mapNotNull(::parseMetadataLine).firstOrNull())
             is InputKind.DirectUrl -> listOfNotNull(run(kind.value, listOf("--no-playlist", "--print", METADATA_FORMAT)).lineSequence().mapNotNull(::parseMetadataLine).firstOrNull())
             is InputKind.YouTubePlaylist -> run(kind.value, listOf("--flat-playlist", "--playlist-end", "200", "--print", PLAYLIST_FORMAT)).lineSequence().mapNotNull(::parseFlatPlaylistLine).take(200).toList()
-            is InputKind.SpotifyUrl -> throw ExtractorError.Unsupported
+            is InputKind.SpotifyUrl -> spotify.resolve(kind.value) { query ->
+                listOfNotNull(run("ytsearch3:$query", listOf("--flat-playlist", "--match-filter", "live_status!=is_live", "--print", SEARCH_FORMAT)).lineSequence().mapNotNull(::parseMetadataLine).firstOrNull())
+            }
         }.ifEmpty { throw ExtractorError.NoResults }
     } }
 
@@ -75,18 +86,21 @@ class ExtractorRepository private constructor(
         withContext(Dispatchers.IO) { InputClassifier.classify(track.originalUrl) }
         val common = listOf("-j", "-f", STREAM_FORMAT, "--no-playlist")
         var lastError: ExtractorError? = null
-        val clients = if (finalOnly) listOf("android,web") else listOf("visionos,default", "android,web")
-        for (client in clients) {
-            val stage = if (client == "android,web") Timing.Stage.STREAM_FINAL else Timing.Stage.STREAM_PRIMARY
+        // finalOnly is the one remaining strategy after an initial playback 403.
+        val strategies = if (finalOnly) listOf(StreamStrategy.VISIONOS_DEFAULT) else StreamStrategy.entries
+        for (strategy in strategies) {
+            val stage = when (strategy) {
+                StreamStrategy.ANDROID_WEB -> Timing.Stage.STREAM_PRIMARY
+                StreamStrategy.VISIONOS_DEFAULT -> Timing.Stage.STREAM_FINAL
+            }
             val started = timing.start()
             var outcome = Timing.Outcome.ERROR
             try {
-                val stream = parseStreamJson(run(track.originalUrl, common + listOf("--extractor-args", "youtube:player_client=$client")))
-                val finalStrategy = client == "android,web"
-                if (stream != null && (finalStrategy || !stream.url.contains("c=TVHTML5"))) {
+                val stream = parseStreamJson(run(track.originalUrl, common + listOf("--extractor-args", "youtube:player_client=${strategy.clients}")))
+                if (stream != null && (strategy == StreamStrategy.ANDROID_WEB || !stream.url.contains("c=TVHTML5"))) {
                     withContext(Dispatchers.IO) { InputClassifier.validateStreamUrl(stream.url) }
                     outcome = Timing.Outcome.SUCCESS
-                    return ResolvedStream(stream, finalStrategy)
+                    return ResolvedStream(stream, strategy)
                 }
                 outcome = if (stream == null) Timing.Outcome.NO_RESULTS else Timing.Outcome.UNUSABLE_STREAM
             } catch (error: CancellationException) { outcome = Timing.Outcome.CANCELLED; throw error }
@@ -109,26 +123,14 @@ class ExtractorRepository private constructor(
             val option = options[index++]
             if (index < options.size && !options[index].startsWith("-")) request.addOption(option, options[index++]) else request.addOption(option)
         }
-        return try {
-            withTimeout(30_000) {
-                suspendCancellableCoroutine { continuation ->
-                    val executor = Executors.newSingleThreadExecutor()
-                    val cleanup = Executors.newSingleThreadScheduledExecutor()
-                    continuation.invokeOnCancellation {
-                        synchronized(cleanup) {
-                            if (!cleanup.isShutdown) cleanup.scheduleWithFixedDelay({ YoutubeDL.destroyProcessById(id) }, 0, 100, TimeUnit.MILLISECONDS)
-                        }
-                    }
-                    executor.execute {
-                        try {
-                            val output = YoutubeDL.execute(request, id).out
-                            if (continuation.isActive) continuation.resumeWith(Result.success(output))
-                        } catch (_: Exception) {
-                            if (continuation.isActive) continuation.resumeWith(Result.failure(ExtractorError.Failed))
-                        } finally { synchronized(cleanup) { cleanup.shutdownNow() }; executor.shutdown() }
-                    }
-                }
+        return withTimeoutOrNull(30_000) {
+            try {
+                YtDlpExecution { YoutubeDL.destroyProcessById(id) }.execute { YoutubeDL.execute(request, id).out }
+            } catch (error: CancellationException) { throw error }
+            catch (error: Exception) {
+                timing.extractionException(error)
+                throw ExtractorError.Failed
             }
-        } catch (_: TimeoutCancellationException) { throw ExtractorError.Timeout }
+        } ?: run { timing.extractionTimeout(); throw ExtractorError.Timeout }
     }
 }

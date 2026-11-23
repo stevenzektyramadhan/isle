@@ -24,4 +24,9 @@ class YtDlpUpdaterTest {
     @Test fun successfulUpdateIsReported() {
         assertTrue(attemptUpdate { })
     }
+
+    @Test fun manualCheckBypassesRecentAttempt() {
+        assertTrue(shouldCheck(101, 100, manual = true))
+    }
+
 }
