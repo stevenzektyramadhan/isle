@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -49,7 +50,10 @@ fun HomeScreen(
     onInputChange: (String) -> Unit,
     onSubmit: () -> Unit,
     onTogglePlayback: () -> Unit,
+    onOpenPlayer: () -> Unit = {},
     modifier: Modifier = Modifier,
+    onOpenSettings: () -> Unit = {},
+    updateNotice: @Composable () -> Unit = {},
 ) {
     Surface(modifier = modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(
@@ -59,6 +63,8 @@ fun HomeScreen(
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
+            TextButton(onClick = onOpenSettings, modifier = Modifier.height(48.dp)) { Text("Settings") }
+            updateNotice()
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text("ISLE", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                 Text("Your music,\nin its own current.", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
@@ -110,7 +116,7 @@ fun HomeScreen(
                 Surface(
                     color = MaterialTheme.colorScheme.surface,
                     shape = MaterialTheme.shapes.large,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().clickable(onClickLabel = "Open player", onClick = onOpenPlayer),
                 ) {
                     Row(
                         modifier = Modifier.padding(start = 18.dp, top = 16.dp, end = 12.dp, bottom = 16.dp),
