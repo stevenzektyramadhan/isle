@@ -23,6 +23,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import io.github.stevenzektyramadhan.isle.update.ManualUpdateResult
@@ -60,35 +62,49 @@ class MainActivity : ComponentActivity() {
                     var result by remember { mutableStateOf<ManualUpdateResult?>(null) }
                     BackHandler { settingsOpen = false }
                     Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                            TextButton(onClick = { settingsOpen = false }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Back") }
-                            Text("Settings", style = MaterialTheme.typography.headlineSmall)
-                            Text("App version ${packageManager.getPackageInfo(packageName, 0).versionName}")
-                            Button(onClick = { appUpdate.check(true) }, enabled = !appUpdate.checking, modifier = Modifier.heightIn(min = 48.dp)) {
-                                Text(if (appUpdate.checking) "Checking Isle update..." else "Check for Isle app update")
+                        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                TextButton(onClick = { settingsOpen = false }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Back") }
+                                Text("SETTINGS", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
                             }
-                            AppUpdateNotice(appUpdate, this@MainActivity)
-                            if (appUpdate.manual && !appUpdate.checking) {
-                                when (appUpdate.result) {
-                                    AppUpdateResult.Current -> Text("Isle is up to date")
-                                    AppUpdateResult.Error -> Text("Could not check for Isle updates. Check your connection and try again.", color = MaterialTheme.colorScheme.error)
-                                    else -> Unit
+                            Text("Settings", style = MaterialTheme.typography.headlineMedium)
+                            Surface(color = MaterialTheme.colorScheme.surface, shape = MaterialTheme.shapes.large, modifier = Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Text("ABOUT ISLE", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                                    Text("App version ${packageManager.getPackageInfo(packageName, 0).versionName}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Button(onClick = { appUpdate.check(true) }, enabled = !appUpdate.checking, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), shape = CircleShape) {
+                                        Text(if (appUpdate.checking) "Checking Isle update..." else "Check for Isle app update")
+                                    }
+                                    AppUpdateNotice(appUpdate, this@MainActivity)
+                                    if (appUpdate.manual && !appUpdate.checking) {
+                                        when (appUpdate.result) {
+                                            AppUpdateResult.Current -> Text("Isle is up to date")
+                                            AppUpdateResult.Error -> Text("Could not check for Isle updates. Check your connection and try again.", color = MaterialTheme.colorScheme.error)
+                                            else -> Unit
+                                        }
+                                    }
                                 }
                             }
-                            Button(onClick = {
-                                checking = true
-                                result = null
-                                scope.launch {
-                                    try { result = updater.checkManually() } finally { checking = false }
+                            Surface(color = MaterialTheme.colorScheme.surface, shape = MaterialTheme.shapes.large, modifier = Modifier.fillMaxWidth()) {
+                                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Text("AUDIO ENGINE", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+                                    Text("yt-dlp provides media extraction for supported links and searches.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Button(onClick = {
+                                        checking = true
+                                        result = null
+                                        scope.launch {
+                                            try { result = updater.checkManually() } finally { checking = false }
+                                        }
+                                    }, enabled = !checking, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), shape = CircleShape) {
+                                        Text(if (checking) "Checking..." else "Check for yt-dlp update")
+                                    }
+                                    when (result) {
+                                        ManualUpdateResult.SUCCESS -> Text("yt-dlp update check completed")
+                                        ManualUpdateResult.FAILURE -> Text("yt-dlp update failed", color = MaterialTheme.colorScheme.error)
+                                        ManualUpdateResult.INTEGRATION_REQUIRED -> Text("Update unavailable until extractor coordination is enabled", color = MaterialTheme.colorScheme.error)
+                                        null -> Unit
+                                    }
                                 }
-                            }, enabled = !checking, modifier = Modifier.heightIn(min = 48.dp)) {
-                                Text(if (checking) "Checking..." else "Check for yt-dlp update")
-                            }
-                            when (result) {
-                                ManualUpdateResult.SUCCESS -> Text("yt-dlp update check completed")
-                                ManualUpdateResult.FAILURE -> Text("yt-dlp update failed", color = MaterialTheme.colorScheme.error)
-                                ManualUpdateResult.INTEGRATION_REQUIRED -> Text("Update unavailable until extractor coordination is enabled", color = MaterialTheme.colorScheme.error)
-                                null -> Unit
                             }
                         }
                     }

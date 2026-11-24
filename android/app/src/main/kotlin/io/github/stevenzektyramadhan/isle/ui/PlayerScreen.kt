@@ -6,6 +6,7 @@ import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -40,25 +41,27 @@ fun PlayerScreen(state: PlayerState, onCommand: (PlayerCommand) -> Unit, onClose
     }
     Surface(color = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxSize()) {
         Column(
-            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(if (landscape) 8.dp else 24.dp),
+            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(if (landscape) 12.dp else 20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(if (landscape) 0.dp else 16.dp),
+            verticalArrangement = Arrangement.spacedBy(if (landscape) 4.dp else 20.dp),
         ) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onClose, modifier = Modifier.heightIn(min = 48.dp)) { Text("Back") }
+                Text("NOW PLAYING", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
                 TextButton(onClick = { queueOpen = true }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Queue (${state.queue.size})") }
             }
             Box(
-                modifier = Modifier.size(if (landscape) 72.dp else 220.dp).rotate(angle.value)
-                    .background(MaterialTheme.colorScheme.surfaceVariant, CircleShape),
+                modifier = Modifier.size(if (landscape) 108.dp else 240.dp).rotate(angle.value)
+                    .background(MaterialTheme.colorScheme.surface, CircleShape),
                 contentAlignment = Alignment.Center,
             ) {
-                Box(Modifier.align(Alignment.TopCenter).padding(top = if (landscape) 8.dp else 20.dp).size(if (landscape) 4.dp else 8.dp).background(MaterialTheme.colorScheme.onSurfaceVariant, CircleShape))
-                Box(Modifier.size(if (landscape) 32.dp else 96.dp).background(MaterialTheme.colorScheme.primary, CircleShape), contentAlignment = Alignment.Center) {
-                    Box(Modifier.size(if (landscape) 4.dp else 12.dp).background(MaterialTheme.colorScheme.background, CircleShape))
+                Box(Modifier.size(if (landscape) 88.dp else 216.dp).background(MaterialTheme.colorScheme.surfaceVariant, CircleShape), contentAlignment = Alignment.Center) {
+                    Box(Modifier.size(if (landscape) 32.dp else 88.dp).background(MaterialTheme.colorScheme.primaryContainer, CircleShape), contentAlignment = Alignment.Center) {
+                        Box(Modifier.size(if (landscape) 6.dp else 14.dp).background(MaterialTheme.colorScheme.background, CircleShape))
+                    }
                 }
             }
-            Column(Modifier.fillMaxWidth()) {
+            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(track.title, style = MaterialTheme.typography.headlineSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 track.artist?.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             }
@@ -74,21 +77,26 @@ fun PlayerScreen(state: PlayerState, onCommand: (PlayerCommand) -> Unit, onClose
                 Text(duration?.let(::formatPlayerTime) ?: "--:--")
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-                TextButton(onClick = { onCommand(PlayerCommand.Previous) }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Previous") }
-                Button(onClick = { onCommand(PlayerCommand.TogglePlayPause) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(if (state.isPlaying) "Pause" else "Play") }
-                TextButton(onClick = { onCommand(PlayerCommand.Next) }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Next") }
+                OutlinedButton(onClick = { onCommand(PlayerCommand.Previous) }, modifier = Modifier.size(52.dp), shape = CircleShape, contentPadding = PaddingValues(0.dp)) { Text("|◀") }
+                Button(onClick = { onCommand(PlayerCommand.TogglePlayPause) }, modifier = Modifier.size(68.dp), shape = CircleShape, contentPadding = PaddingValues(0.dp)) { Text(if (state.isPlaying) "Ⅱ" else "▶", style = MaterialTheme.typography.titleLarge) }
+                OutlinedButton(onClick = { onCommand(PlayerCommand.Next) }, modifier = Modifier.size(52.dp), shape = CircleShape, contentPadding = PaddingValues(0.dp)) { Text("▶|") }
             }
-            Text("Volume ${(state.volume * 100).toInt()}%", modifier = Modifier.fillMaxWidth())
+            Text("Volume ${(state.volume * 100).toInt()}%", modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
             Slider(value = state.volume.coerceIn(0f, 1f), onValueChange = { onCommand(PlayerCommand.SetVolume(it)) }, modifier = Modifier.fillMaxWidth().semantics { contentDescription = "Volume" })
-            Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
-                Text("Autoplay")
-                Switch(checked = state.autoplayEnabled, onCheckedChange = { onCommand(PlayerCommand.ToggleAutoplay) }, modifier = Modifier.semantics { contentDescription = "Autoplay" })
+            Surface(color = MaterialTheme.colorScheme.surface, shape = MaterialTheme.shapes.medium, modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                    Column {
+                        Text("Autoplay", style = MaterialTheme.typography.titleSmall)
+                        Text("Continue with recommendations", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Switch(checked = state.autoplayEnabled, onCheckedChange = { onCommand(PlayerCommand.ToggleAutoplay) }, modifier = Modifier.semantics { contentDescription = "Autoplay" })
+                }
             }
         }
     }
     if (queueOpen) {
         ModalBottomSheet(onDismissRequest = { queueOpen = false }) {
-            Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 24.dp).heightIn(max = 500.dp)) {
+            Column(Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp).heightIn(max = 500.dp)) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Text("Queue (${state.queue.size})", style = MaterialTheme.typography.titleLarge)
                     Row {
@@ -96,12 +104,17 @@ fun PlayerScreen(state: PlayerState, onCommand: (PlayerCommand) -> Unit, onClose
                         TextButton(onClick = { queueOpen = false }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Close") }
                     }
                 }
-                if (state.queue.isEmpty()) Text("Queue is empty", modifier = Modifier.padding(vertical = 24.dp))
+                if (state.queue.isEmpty()) Text("Queue is empty", modifier = Modifier.padding(vertical = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 else Column(Modifier.verticalScroll(rememberScrollState())) {
-                    state.queue.forEach { item ->
-                        Column(Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
-                            Text(item.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            item.artist?.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    state.queue.forEachIndexed { index, item ->
+                        Surface(color = MaterialTheme.colorScheme.surface, shape = MaterialTheme.shapes.medium, modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
+                            Row(Modifier.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                Text("%02d".format(index + 1), color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium)
+                                Column {
+                                    Text(item.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    item.artist?.takeIf(String::isNotBlank)?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                                }
+                            }
                         }
                     }
                 }
