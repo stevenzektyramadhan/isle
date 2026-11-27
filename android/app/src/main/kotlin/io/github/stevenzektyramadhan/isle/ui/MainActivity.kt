@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.SystemBarStyle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -13,25 +15,17 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.Alignment
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.launch
-import io.github.stevenzektyramadhan.isle.update.ManualUpdateResult
-import io.github.stevenzektyramadhan.isle.update.AppUpdateResult
-import io.github.stevenzektyramadhan.isle.update.YtDlpUpdater
 import io.github.stevenzektyramadhan.isle.IsleApp
 import io.github.stevenzektyramadhan.isle.model.PlayerCommand
+import io.github.stevenzektyramadhan.isle.model.PlayerState
 import io.github.stevenzektyramadhan.isle.player.PlayerEngine
 
 class MainActivity : ComponentActivity() {
@@ -45,6 +39,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -54,83 +52,54 @@ class MainActivity : ComponentActivity() {
             var input by rememberSaveable { mutableStateOf("") }
             var playerOpen by rememberSaveable { mutableStateOf(false) }
             var settingsOpen by rememberSaveable { mutableStateOf(false) }
+            var queueOpen by rememberSaveable { mutableStateOf(false) }
+            var submitCount by rememberSaveable { mutableIntStateOf(0) }
+            var dismissedStatusKey by rememberSaveable { mutableStateOf("") }
+            val statusKey = "${playerState.statusMessage.orEmpty()}#$submitCount"
+            BackHandler(queueOpen || playerOpen || settingsOpen) {
+                when {
+                    queueOpen -> queueOpen = false
+                    playerOpen -> playerOpen = false
+                    settingsOpen -> settingsOpen = false
+                }
+            }
             IsleTheme {
                 if (settingsOpen) {
-                    val updater = remember { YtDlpUpdater(applicationContext) }
-                    val scope = rememberCoroutineScope()
-                    var checking by remember { mutableStateOf(false) }
-                    var result by remember { mutableStateOf<ManualUpdateResult?>(null) }
-                    BackHandler { settingsOpen = false }
-                    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) {
-                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                TextButton(onClick = { settingsOpen = false }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Back") }
-                                Text("SETTINGS", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-                            }
-                            Text("Settings", style = MaterialTheme.typography.headlineMedium)
-                            Surface(color = MaterialTheme.colorScheme.surface, shape = MaterialTheme.shapes.large, modifier = Modifier.fillMaxWidth()) {
-                                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                    Text("ABOUT ISLE", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                                    Text("App version ${packageManager.getPackageInfo(packageName, 0).versionName}", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    Button(onClick = { appUpdate.check(true) }, enabled = !appUpdate.checking, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), shape = CircleShape) {
-                                        Text(if (appUpdate.checking) "Checking Isle update..." else "Check for Isle app update")
-                                    }
-                                    AppUpdateNotice(appUpdate, this@MainActivity)
-                                    if (appUpdate.manual && !appUpdate.checking) {
-                                        when (appUpdate.result) {
-                                            AppUpdateResult.Current -> Text("Isle is up to date")
-                                            AppUpdateResult.Error -> Text("Could not check for Isle updates. Check your connection and try again.", color = MaterialTheme.colorScheme.error)
-                                            else -> Unit
-                                        }
-                                    }
-                                }
-                            }
-                            Surface(color = MaterialTheme.colorScheme.surface, shape = MaterialTheme.shapes.large, modifier = Modifier.fillMaxWidth()) {
-                                Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                                    Text("AUDIO ENGINE", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                                    Text("yt-dlp provides media extraction for supported links and searches.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    Button(onClick = {
-                                        checking = true
-                                        result = null
-                                        scope.launch {
-                                            try { result = updater.checkManually() } finally { checking = false }
-                                        }
-                                    }, enabled = !checking, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp), shape = CircleShape) {
-                                        Text(if (checking) "Checking..." else "Check for yt-dlp update")
-                                    }
-                                    when (result) {
-                                        ManualUpdateResult.SUCCESS -> Text("yt-dlp update check completed")
-                                        ManualUpdateResult.FAILURE -> Text("yt-dlp update failed", color = MaterialTheme.colorScheme.error)
-                                        ManualUpdateResult.INTEGRATION_REQUIRED -> Text("Update unavailable until extractor coordination is enabled", color = MaterialTheme.colorScheme.error)
-                                        null -> Unit
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    SettingsScreen(
+                        playerState = playerState,
+                        appUpdate = appUpdate,
+                        onBack = { settingsOpen = false },
+                        modifier = Modifier.fillMaxSize(),
+                    )
                 } else if (playerOpen && playerState.currentTrack != null) {
                     PlayerScreen(
                         state = playerState,
                         onCommand = playerViewModel::dispatch,
                         onClose = { playerOpen = false },
+                        onOpenQueue = { queueOpen = true },
+                        modifier = Modifier.fillMaxSize().safeDrawingPadding(),
                     )
                 } else {
                 HomeScreen(
                     state = HomeUiState(
                         input = input,
                         isLoading = playerState.isLoading,
-                        errorMessage = playerState.statusMessage.takeUnless { playerState.isLoading },
-                        currentSong = playerState.currentTrack?.let { CurrentSongUi(it.title, it.artist) },
-                        isPlaying = playerState.isPlaying,
+                        statusMessage = playerState.statusMessage,
+                        statusDismissed = dismissedStatusKey == statusKey,
+                        player = playerState,
                     ),
                     onInputChange = { input = it },
-                    onSubmit = { playerViewModel.submit(input) },
+                    onSubmit = { submitCount++; dismissedStatusKey = ""; playerViewModel.submit(input) },
                     onTogglePlayback = playerViewModel::togglePlayback,
+                    onNext = { playerViewModel.dispatch(PlayerCommand.Next) },
                     onOpenPlayer = { playerOpen = true },
+                    onOpenQueue = { queueOpen = true },
                     onOpenSettings = { settingsOpen = true },
-                    updateNotice = { AppUpdateNotice(appUpdate, this@MainActivity) },
+                    updateNotice = { AppUpdateNotice(appUpdate, this@MainActivity, Modifier.fillMaxWidth()) },
+                    onDismissStatus = { dismissedStatusKey = statusKey },
                 )
                 }
+                if (queueOpen) QueueSheet(playerState, playerViewModel::dispatch) { queueOpen = false }
             }
         }
     }

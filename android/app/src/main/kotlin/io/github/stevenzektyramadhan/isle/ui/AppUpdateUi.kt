@@ -1,5 +1,6 @@
 package io.github.stevenzektyramadhan.isle.ui
 
+import io.github.stevenzektyramadhan.isle.R
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
@@ -7,6 +8,7 @@ import android.net.Uri
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -17,6 +19,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -77,18 +80,20 @@ class AppUpdateViewModel(private val checker: AppUpdateChecker) : ViewModel() {
 }
 
 @Composable
-fun AppUpdateNotice(viewModel: AppUpdateViewModel, context: Context) {
+fun AppUpdateNotice(viewModel: AppUpdateViewModel, context: Context, modifier: Modifier = Modifier) {
     val update = viewModel.result as? AppUpdateResult.Available ?: return
     if (viewModel.dismissed) return
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text("Isle ${update.version} is available", style = MaterialTheme.typography.titleMedium)
-        Text("Open the release page to download and install it yourself.")
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { viewModel.openRelease(context, update) }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Update") }
-            TextButton(onClick = viewModel::dismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text("Later") }
-        }
-        if (viewModel.browserError) {
-            Text("Could not open the release page. Install or enable a browser and try again.", color = MaterialTheme.colorScheme.error)
+    SectionCard(modifier) {
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(stringResource(R.string.update_available, update.version), style = MaterialTheme.typography.titleMedium)
+            Text(stringResource(R.string.update_description))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { viewModel.openRelease(context, update) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(stringResource(R.string.update_action)) }
+                TextButton(onClick = viewModel::dismiss, modifier = Modifier.heightIn(min = 48.dp)) { Text(stringResource(R.string.update_later)) }
+            }
+            if (viewModel.browserError) {
+                Text(stringResource(R.string.update_browser_error), color = MaterialTheme.colorScheme.error)
+            }
         }
     }
 }
