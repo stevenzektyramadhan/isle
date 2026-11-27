@@ -115,6 +115,10 @@ fun SettingsScreen(
                 }
             }
 
+            if (appUpdate.result is AppUpdateResult.Available) {
+                AppUpdateNotice(appUpdate, LocalContext.current, Modifier.fillMaxWidth())
+            }
+
             // yt-dlp engine card
             SectionCard {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {

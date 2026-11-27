@@ -50,9 +50,20 @@
     <string name="autoplay">Putar otomatis</string>
     <string name="autoplay_description">Lanjutkan dengan lagu serupa</string>
     <string name="update_available">Isle %1$s tersedia</string>
-    <string name="update_description">Buka halaman rilis untuk mengunduh dan memasangnya.</string>
+    <string name="update_description">Unduh dan pasang versi terbaru langsung dari Isle.</string>
+    <string name="update_description_browser">Buka halaman rilis untuk mengunduh dan memasangnya.</string>
     <string name="update_action">Perbarui</string>
     <string name="update_later">Nanti</string>
+    <string name="update_cancel">Batal</string>
+    <string name="update_downloading">Mengunduh pembaruan…</string>
+    <string name="update_downloading_percent">Mengunduh pembaruan… %1$d%%</string>
+    <string name="update_ready_to_install">Pembaruan selesai diunduh dan siap dipasang.</string>
+    <string name="update_install_action">Pasang</string>
+    <string name="update_permission_needed">Izinkan Isle memasang aplikasi di Pengaturan, lalu kembali untuk melanjutkan.</string>
+    <string name="update_allow_install">Izinkan &amp; Pasang</string>
+    <string name="update_download_failed">Pembaruan gagal diunduh. Periksa koneksi atau buka di browser.</string>
+    <string name="update_retry">Coba lagi</string>
+    <string name="update_open_browser">Buka di browser</string>
     <string name="update_browser_error">Halaman rilis tidak dapat dibuka. Pasang atau aktifkan browser lalu coba lagi.</string>
     <!-- Player -->
     <string name="player_close">Ciutkan pemutar</string>

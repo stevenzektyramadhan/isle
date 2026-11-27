@@ -50,9 +50,20 @@
     <string name="autoplay">Autoplay</string>
     <string name="autoplay_description">Continue with similar songs</string>
     <string name="update_available">Isle %1$s is available</string>
-    <string name="update_description">Open the release page to download and install it yourself.</string>
+    <string name="update_description">Download and install the latest version directly in Isle.</string>
+    <string name="update_description_browser">Open the release page to download and install it yourself.</string>
     <string name="update_action">Update</string>
     <string name="update_later">Later</string>
+    <string name="update_cancel">Cancel</string>
+    <string name="update_downloading">Downloading update…</string>
+    <string name="update_downloading_percent">Downloading update… %1$d%%</string>
+    <string name="update_ready_to_install">Update downloaded and ready to install.</string>
+    <string name="update_install_action">Install</string>
+    <string name="update_permission_needed">Allow Isle to install updates in Settings, then return to continue.</string>
+    <string name="update_allow_install">Allow &amp; Install</string>
+    <string name="update_download_failed">Could not download the update. Check your connection or open in browser.</string>
+    <string name="update_retry">Retry</string>
+    <string name="update_open_browser">Open in browser</string>
     <string name="update_browser_error">Could not open the release page. Install or enable a browser and try again.</string>
     <!-- Player -->
     <string name="player_close">Collapse player</string>

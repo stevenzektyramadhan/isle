@@ -74,12 +74,12 @@ class AppUpdateCheckerTest {
         }
     }
 
-    private fun checker(version: String, body: String): AppUpdateChecker {
+    private fun checker(version: String, body: String, abis: List<String> = listOf("arm64-v8a")): AppUpdateChecker {
         val client = OkHttpClient.Builder().addInterceptor { chain ->
             Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200)
                 .message("OK").body(body.toResponseBody("application/json".toMediaType())).build()
         }.build()
-        return AppUpdateChecker(version, client)
+        return AppUpdateChecker(version, client, abis)
     }
 
     @Test fun selectsNewestAndroidPrereleaseAndCanonicalUrl() = runBlocking {
@@ -117,5 +117,63 @@ class AppUpdateCheckerTest {
     @Test fun returnsErrorForTimeout() = runBlocking {
         val client = OkHttpClient.Builder().addInterceptor(Interceptor { throw SocketTimeoutException() }).build()
         assertTrue(AppUpdateChecker("1.0.0", client).check() is AppUpdateResult.Error)
+    }
+
+    @Test fun selectsMatchingAbiApkAsset() = runBlocking {
+        val body = """[{
+            "tag_name":"android-v2.0.0",
+            "draft":false,
+            "assets":[
+                {"name":"app-x86_64-release.apk","browser_download_url":"https://github.com/stevenzektyramadhan/isle/releases/download/android-v2.0.0/app-x86_64-release.apk"},
+                {"name":"app-arm64-v8a-release.apk","browser_download_url":"https://github.com/stevenzektyramadhan/isle/releases/download/android-v2.0.0/app-arm64-v8a-release.apk"}
+            ]
+        }]"""
+        val result = checker("1.0.0", body, listOf("arm64-v8a", "armeabi-v7a")).check()
+        assertEquals(
+            AppUpdateResult.Available(
+                "2.0.0",
+                "https://github.com/stevenzektyramadhan/isle/releases/tag/android-v2.0.0",
+                "https://github.com/stevenzektyramadhan/isle/releases/download/android-v2.0.0/app-arm64-v8a-release.apk",
+            ),
+            result,
+        )
+    }
+
+    @Test fun rejectsUntrustedApkAssetUrl() = runBlocking {
+        val body = """[{
+            "tag_name":"android-v2.0.0",
+            "draft":false,
+            "assets":[
+                {"name":"app-arm64-v8a-release.apk","browser_download_url":"https://evil.test/app-arm64-v8a-release.apk"}
+            ]
+        }]"""
+        val result = checker("1.0.0", body, listOf("arm64-v8a")).check()
+        assertEquals(
+            AppUpdateResult.Available(
+                "2.0.0",
+                "https://github.com/stevenzektyramadhan/isle/releases/tag/android-v2.0.0",
+                null,
+            ),
+            result,
+        )
+    }
+
+    @Test fun fallsBackToUniversalApkWhenAbiMissing() = runBlocking {
+        val body = """[{
+            "tag_name":"android-v2.0.0",
+            "draft":false,
+            "assets":[
+                {"name":"app-universal-release.apk","browser_download_url":"https://github.com/stevenzektyramadhan/isle/releases/download/android-v2.0.0/app-universal-release.apk"}
+            ]
+        }]"""
+        val result = checker("1.0.0", body, listOf("armeabi-v7a")).check()
+        assertEquals(
+            AppUpdateResult.Available(
+                "2.0.0",
+                "https://github.com/stevenzektyramadhan/isle/releases/tag/android-v2.0.0",
+                "https://github.com/stevenzektyramadhan/isle/releases/download/android-v2.0.0/app-universal-release.apk",
+            ),
+            result,
+        )
     }
 }

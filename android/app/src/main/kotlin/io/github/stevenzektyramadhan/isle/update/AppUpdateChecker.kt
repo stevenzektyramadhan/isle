@@ -1,5 +1,6 @@
 package io.github.stevenzektyramadhan.isle.update
 
+import android.os.Build
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
@@ -21,7 +22,11 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 
 sealed interface AppUpdateResult {
-    data class Available(val version: String, val releaseUrl: String) : AppUpdateResult
+    data class Available(
+        val version: String,
+        val releaseUrl: String,
+        val apkUrl: String? = null,
+    ) : AppUpdateResult
     data object Current : AppUpdateResult
     data object Error : AppUpdateResult
 }
@@ -30,6 +35,7 @@ sealed interface AppUpdateResult {
 class AppUpdateChecker(
     private val installedVersion: String,
     client: OkHttpClient = OkHttpClient(),
+    private val supportedAbis: List<String> = Build.SUPPORTED_ABIS?.toList().orEmpty(),
 ) {
     private val client = client.newBuilder()
         .callTimeout(15, TimeUnit.SECONDS)
@@ -42,7 +48,7 @@ class AppUpdateChecker(
     suspend fun check(): AppUpdateResult = withContext(Dispatchers.IO) {
         val current = Version.parse(installedVersion) ?: return@withContext AppUpdateResult.Error
         try {
-            var newest: Version? = null
+            var newest: Pair<Version, String?>? = null
             for (page in 1..MAX_PAGES) {
                 coroutineContext.ensureActive()
                 val request = Request.Builder()
@@ -60,11 +66,17 @@ class AppUpdateChecker(
                     val tag = (release["tag_name"] as? JsonPrimitive)?.contentOrNull ?: return@withContext AppUpdateResult.Error
                     if (!tag.startsWith("android-v")) continue
                     val version = Version.parse(tag.removePrefix("android-v")) ?: continue
-                    if (version > current && (newest == null || version > newest)) newest = version
+                    if (version > current && (newest == null || version > newest.first)) {
+                        newest = version to selectApkUrl(release, version)
+                    }
                 }
                 if (releases.size < PAGE_SIZE) {
-                    return@withContext newest?.let {
-                        AppUpdateResult.Available(it.text, "https://github.com/stevenzektyramadhan/isle/releases/tag/android-v${it.text}")
+                    return@withContext newest?.let { (version, apkUrl) ->
+                        AppUpdateResult.Available(
+                            version = version.text,
+                            releaseUrl = "https://github.com/stevenzektyramadhan/isle/releases/tag/android-v${version.text}",
+                            apkUrl = apkUrl,
+                        )
                     } ?: AppUpdateResult.Current
                 }
             }
@@ -76,6 +88,24 @@ class AppUpdateChecker(
         } catch (_: IllegalArgumentException) {
             AppUpdateResult.Error
         }
+    }
+
+    private fun selectApkUrl(release: JsonObject, version: Version): String? {
+        val assets = release["assets"] as? JsonArray ?: return null
+        val expectedPrefix = "https://github.com/stevenzektyramadhan/isle/releases/download/android-v${version.text}/"
+        val byName = HashMap<String, String>()
+        for (item in assets) {
+            val asset = item as? JsonObject ?: continue
+            val name = (asset["name"] as? JsonPrimitive)?.contentOrNull ?: continue
+            val url = (asset["browser_download_url"] as? JsonPrimitive)?.contentOrNull ?: continue
+            if (url.startsWith(expectedPrefix) && name.endsWith(".apk")) {
+                byName[name] = url
+            }
+        }
+        for (abi in supportedAbis) {
+            byName["app-$abi-release.apk"]?.let { return it }
+        }
+        return byName["app-universal-release.apk"]
     }
 
     private suspend fun fetch(request: Request): String? = suspendCancellableCoroutine { continuation ->
