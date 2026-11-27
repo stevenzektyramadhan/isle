@@ -30,6 +30,7 @@
     <string name="home_title">Isle</string>
     <string name="home_search_placeholder">Search songs or paste a link</string>
     <string name="home_clear">Clear search</string>
+    <string name="home_paste">Paste from clipboard</string>
     <string name="home_search_hint">Song title · YouTube link or playlist · Spotify link</string>
     <string name="home_searching_title">Searching</string>
     <string name="home_searching_message">Searching “%1$s”…</string>
@@ -80,5 +81,8 @@
     <string name="settings_ytdlp_integration">Update not available in this version.</string>
     <string name="settings_ytdlp_active">Core active</string>
     <string name="settings_ytdlp_unavailable">Unavailable</string>
+    <string name="settings_ytdlp_version">Version: %1$s</string>
+    <string name="settings_ytdlp_last_checked">Last checked: %1$s</string>
+    <string name="settings_ytdlp_never_checked">Last checked: Never</string>
     <string name="settings_back">Back</string>
 </resources>

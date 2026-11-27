@@ -13,6 +13,7 @@ import androidx.activity.viewModels
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -43,11 +44,17 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
         )
-        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
         setContent {
             val playerState by playerViewModel.state.collectAsStateWithLifecycle()
+            var notificationPrompted by rememberSaveable { mutableStateOf(false) }
+            LaunchedEffect(playerState.isPlaying) {
+                if (playerState.isPlaying && !notificationPrompted) {
+                    notificationPrompted = true
+                    if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                }
+            }
             val appUpdate = appUpdateViewModel
             var input by rememberSaveable { mutableStateOf("") }
             var playerOpen by rememberSaveable { mutableStateOf(false) }
@@ -85,6 +92,7 @@ class MainActivity : ComponentActivity() {
                         input = input,
                         isLoading = playerState.isLoading,
                         statusMessage = playerState.statusMessage,
+                        status = playerState.status,
                         statusDismissed = dismissedStatusKey == statusKey,
                         player = playerState,
                     ),

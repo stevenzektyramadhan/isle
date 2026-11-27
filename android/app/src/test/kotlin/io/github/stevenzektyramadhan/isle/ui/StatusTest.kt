@@ -1,5 +1,7 @@
 package io.github.stevenzektyramadhan.isle.ui
 
+import io.github.stevenzektyramadhan.isle.model.PlayerState
+import io.github.stevenzektyramadhan.isle.model.PlayerStatusCode
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -27,5 +29,13 @@ class StatusTest {
         assertNull(status.messageRes)
         assertEquals("Unexpected failure", status.detail)
         assertEquals(setOf(StatusAction.Dismiss), status.actions)
+    }
+
+    @Test
+    fun playerStateExposesStructuredStatus() {
+        assertNull(PlayerState().status)
+        val timeoutState = PlayerState(statusMessage = "Request timed out")
+        assertEquals(PlayerStatusCode.REQUEST_TIMED_OUT, timeoutState.status?.code)
+        assertEquals(StatusAction.Retry in mapStatus(timeoutState.status!!).actions, true)
     }
 }

@@ -1,5 +1,6 @@
 package io.github.stevenzektyramadhan.isle.ui
 
+import android.content.ClipboardManager
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -52,6 +53,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.stevenzektyramadhan.isle.R
 import io.github.stevenzektyramadhan.isle.model.PlayerState
+import io.github.stevenzektyramadhan.isle.model.PlayerStatus
+import io.github.stevenzektyramadhan.isle.model.classifyPlayerStatus
 
 @Composable
 fun HomeScreen(
@@ -71,6 +74,7 @@ fun HomeScreen(
     val resources = LocalResources.current
     val settingsDescription = stringResource(R.string.settings)
     val clearDescription = stringResource(R.string.home_clear)
+    val pasteDescription = stringResource(R.string.home_paste)
     val searchDescription = stringResource(R.string.search)
     var focused by rememberSaveable { mutableStateOf(false) }
     Surface(modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -128,6 +132,28 @@ fun HomeScreen(
                                     modifier = Modifier.size(20.dp),
                                 )
                             }
+                        } else if (!state.isLoading) {
+                            IconButton(
+                                onClick = {
+                                    val clipboard = context.getSystemService(ClipboardManager::class.java)
+                                    val pasted = clipboard?.primaryClip
+                                        ?.takeIf { it.itemCount > 0 }
+                                        ?.getItemAt(0)
+                                        ?.coerceToText(context)
+                                        ?.toString()
+                                        ?.trim()
+                                        ?.takeIf { it.isNotEmpty() }
+                                    if (pasted != null) onInputChange(pasted)
+                                },
+                                modifier = Modifier.size(48.dp),
+                            ) {
+                                Icon(
+                                    painterResource(R.drawable.ic_content_paste),
+                                    contentDescription = pasteDescription,
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
                         }
                         Surface(
                             onClick = { if (state.input.isNotBlank() && !state.isLoading) onSubmit() },
@@ -156,8 +182,9 @@ fun HomeScreen(
                         error = false,
                         actions = { LinearProgressIndicator(Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.primary) },
                     )
-                    state.statusMessage != null && !state.statusDismissed -> {
-                        val status = mapStatus(state.statusMessage)
+                    (state.status ?: state.statusMessage?.let(::classifyPlayerStatus)) != null && !state.statusDismissed -> {
+                        val playerStatus = state.status ?: classifyPlayerStatus(state.statusMessage!!)
+                        val status = mapStatus(playerStatus)
                         StatusCard(
                             title = status.title(context), message = status.message(context), error = status.severity == StatusSeverity.Error,
                             detail = status.detail,
@@ -191,6 +218,7 @@ data class HomeUiState(
     val input: String = "",
     val isLoading: Boolean = false,
     val statusMessage: String? = null,
+    val status: PlayerStatus? = null,
     val statusDismissed: Boolean = false,
     val player: PlayerState = PlayerState(),
 )

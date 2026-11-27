@@ -19,6 +19,8 @@ import io.github.stevenzektyramadhan.isle.model.PlayerState
 import io.github.stevenzektyramadhan.isle.update.AppUpdateResult
 import io.github.stevenzektyramadhan.isle.update.ManualUpdateResult
 import io.github.stevenzektyramadhan.isle.update.YtDlpUpdater
+import java.text.DateFormat
+import java.util.Date
 import kotlinx.coroutines.launch
 
 @Composable
@@ -40,6 +42,13 @@ fun SettingsScreen(
     val scope = rememberCoroutineScope()
     var ytdlpChecking by remember { mutableStateOf(false) }
     var ytdlpResult by remember { mutableStateOf<ManualUpdateResult?>(null) }
+    var ytdlpVersion by remember { mutableStateOf<String?>(null) }
+    var ytdlpLastCheckSecs by remember { mutableStateOf<Long?>(null) }
+
+    LaunchedEffect(updater) {
+        ytdlpVersion = updater.installedVersion()
+        ytdlpLastCheckSecs = updater.lastCheckEpochSecs()
+    }
 
     Surface(modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(
@@ -123,12 +132,40 @@ fun SettingsScreen(
                         }
                     }
                     Text(stringResource(R.string.settings_engine_description), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    val formattedLastCheck = remember(ytdlpLastCheckSecs) {
+                        ytdlpLastCheckSecs?.let { secs ->
+                            DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(secs * 1_000L))
+                        }
+                    }
+                    if (ytdlpVersion != null || formattedLastCheck != null) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            ytdlpVersion?.let { version ->
+                                Text(
+                                    stringResource(R.string.settings_ytdlp_version, version),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Text(
+                                formattedLastCheck?.let { stringResource(R.string.settings_ytdlp_last_checked, it) }
+                                    ?: stringResource(R.string.settings_ytdlp_never_checked),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
                     FilledTonalButton(
                         onClick = {
                             ytdlpChecking = true
                             ytdlpResult = null
                             scope.launch {
-                                try { ytdlpResult = updater.checkManually() } finally { ytdlpChecking = false }
+                                try {
+                                    ytdlpResult = updater.checkManually()
+                                    ytdlpVersion = updater.installedVersion()
+                                    ytdlpLastCheckSecs = updater.lastCheckEpochSecs()
+                                } finally {
+                                    ytdlpChecking = false
+                                }
                             }
                         },
                         enabled = !ytdlpChecking,

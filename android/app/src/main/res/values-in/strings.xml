@@ -30,6 +30,7 @@
     <string name="home_title">Isle</string>
     <string name="home_search_placeholder">Cari lagu atau tempel tautan</string>
     <string name="home_clear">Hapus pencarian</string>
+    <string name="home_paste">Tempel dari clipboard</string>
     <string name="home_search_hint">Judul lagu · tautan atau playlist YouTube · tautan Spotify</string>
     <string name="home_searching_title">Mencari</string>
     <string name="home_searching_message">Mencari “%1$s”…</string>
@@ -80,5 +81,8 @@
     <string name="settings_ytdlp_integration">Pembaruan belum tersedia di versi ini.</string>
     <string name="settings_ytdlp_active">Aktif</string>
     <string name="settings_ytdlp_unavailable">Tidak tersedia</string>
+    <string name="settings_ytdlp_version">Versi: %1$s</string>
+    <string name="settings_ytdlp_last_checked">Terakhir diperiksa: %1$s</string>
+    <string name="settings_ytdlp_never_checked">Terakhir diperiksa: Belum pernah</string>
     <string name="settings_back">Kembali</string>
 </resources>

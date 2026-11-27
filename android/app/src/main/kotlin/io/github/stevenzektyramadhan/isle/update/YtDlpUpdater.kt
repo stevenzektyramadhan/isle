@@ -55,6 +55,25 @@ internal fun attemptUpdate(update: () -> Unit): Boolean = try {
 class YtDlpUpdater(context: Context) {
     private val appContext = context.applicationContext
 
+    /** Read-only accessor for the last yt-dlp update check timestamp in epoch seconds. */
+    suspend fun lastCheckEpochSecs(): Long? = withContext(Dispatchers.IO) {
+        val stored = appContext.updateSettings.data.first()[lastCheck]
+        if (stored != null) return@withContext stored
+        val prefs = appContext.getSharedPreferences("ytdlp_update", Context.MODE_PRIVATE)
+        if (prefs.contains(LAST_CHECK_KEY)) prefs.getLong(LAST_CHECK_KEY, 0) else null
+    }
+
+    /** Read-only accessor for the installed yt-dlp version string, if available. */
+    suspend fun installedVersion(): String? = withContext(Dispatchers.IO) {
+        try {
+            YoutubeDL.getInstance().version(appContext)?.trim()?.takeIf { it.isNotEmpty() }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     /** Called on IO after YoutubeDL.init. */
     fun check(): Boolean = runBlocking { checkInternal(manual = false) }
 
