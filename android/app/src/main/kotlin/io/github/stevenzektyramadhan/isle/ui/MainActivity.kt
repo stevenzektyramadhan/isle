@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.SystemBarStyle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -11,25 +13,20 @@ import androidx.activity.viewModels
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.launch
-import io.github.stevenzektyramadhan.isle.update.ManualUpdateResult
-import io.github.stevenzektyramadhan.isle.update.AppUpdateResult
-import io.github.stevenzektyramadhan.isle.update.YtDlpUpdater
 import io.github.stevenzektyramadhan.isle.IsleApp
 import io.github.stevenzektyramadhan.isle.model.PlayerCommand
+import io.github.stevenzektyramadhan.isle.model.PlayerState
 import io.github.stevenzektyramadhan.isle.player.PlayerEngine
 
 class MainActivity : ComponentActivity() {
@@ -43,78 +40,74 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         setContent {
             val playerState by playerViewModel.state.collectAsStateWithLifecycle()
+            var notificationPrompted by rememberSaveable { mutableStateOf(false) }
+            LaunchedEffect(playerState.isPlaying) {
+                if (playerState.isPlaying && !notificationPrompted) {
+                    notificationPrompted = true
+                    if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                }
+            }
             val appUpdate = appUpdateViewModel
             var input by rememberSaveable { mutableStateOf("") }
             var playerOpen by rememberSaveable { mutableStateOf(false) }
             var settingsOpen by rememberSaveable { mutableStateOf(false) }
+            var queueOpen by rememberSaveable { mutableStateOf(false) }
+            var submitCount by rememberSaveable { mutableIntStateOf(0) }
+            var dismissedStatusKey by rememberSaveable { mutableStateOf("") }
+            val statusKey = "${playerState.statusMessage.orEmpty()}#$submitCount"
+            BackHandler(queueOpen || playerOpen || settingsOpen) {
+                when {
+                    queueOpen -> queueOpen = false
+                    playerOpen -> playerOpen = false
+                    settingsOpen -> settingsOpen = false
+                }
+            }
             IsleTheme {
                 if (settingsOpen) {
-                    val updater = remember { YtDlpUpdater(applicationContext) }
-                    val scope = rememberCoroutineScope()
-                    var checking by remember { mutableStateOf(false) }
-                    var result by remember { mutableStateOf<ManualUpdateResult?>(null) }
-                    BackHandler { settingsOpen = false }
-                    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                            TextButton(onClick = { settingsOpen = false }, modifier = Modifier.heightIn(min = 48.dp)) { Text("Back") }
-                            Text("Settings", style = MaterialTheme.typography.headlineSmall)
-                            Text("App version ${packageManager.getPackageInfo(packageName, 0).versionName}")
-                            Button(onClick = { appUpdate.check(true) }, enabled = !appUpdate.checking, modifier = Modifier.heightIn(min = 48.dp)) {
-                                Text(if (appUpdate.checking) "Checking Isle update..." else "Check for Isle app update")
-                            }
-                            AppUpdateNotice(appUpdate, this@MainActivity)
-                            if (appUpdate.manual && !appUpdate.checking) {
-                                when (appUpdate.result) {
-                                    AppUpdateResult.Current -> Text("Isle is up to date")
-                                    AppUpdateResult.Error -> Text("Could not check for Isle updates. Check your connection and try again.", color = MaterialTheme.colorScheme.error)
-                                    else -> Unit
-                                }
-                            }
-                            Button(onClick = {
-                                checking = true
-                                result = null
-                                scope.launch {
-                                    try { result = updater.checkManually() } finally { checking = false }
-                                }
-                            }, enabled = !checking, modifier = Modifier.heightIn(min = 48.dp)) {
-                                Text(if (checking) "Checking..." else "Check for yt-dlp update")
-                            }
-                            when (result) {
-                                ManualUpdateResult.SUCCESS -> Text("yt-dlp update check completed")
-                                ManualUpdateResult.FAILURE -> Text("yt-dlp update failed", color = MaterialTheme.colorScheme.error)
-                                ManualUpdateResult.INTEGRATION_REQUIRED -> Text("Update unavailable until extractor coordination is enabled", color = MaterialTheme.colorScheme.error)
-                                null -> Unit
-                            }
-                        }
-                    }
+                    SettingsScreen(
+                        playerState = playerState,
+                        appUpdate = appUpdate,
+                        onBack = { settingsOpen = false },
+                        modifier = Modifier.fillMaxSize(),
+                    )
                 } else if (playerOpen && playerState.currentTrack != null) {
                     PlayerScreen(
                         state = playerState,
                         onCommand = playerViewModel::dispatch,
                         onClose = { playerOpen = false },
+                        onOpenQueue = { queueOpen = true },
+                        modifier = Modifier.fillMaxSize().safeDrawingPadding(),
                     )
                 } else {
                 HomeScreen(
                     state = HomeUiState(
                         input = input,
                         isLoading = playerState.isLoading,
-                        errorMessage = playerState.statusMessage.takeUnless { playerState.isLoading },
-                        currentSong = playerState.currentTrack?.let { CurrentSongUi(it.title, it.artist) },
-                        isPlaying = playerState.isPlaying,
+                        statusMessage = playerState.statusMessage,
+                        status = playerState.status,
+                        statusDismissed = dismissedStatusKey == statusKey,
+                        player = playerState,
                     ),
                     onInputChange = { input = it },
-                    onSubmit = { playerViewModel.submit(input) },
+                    onSubmit = { submitCount++; dismissedStatusKey = ""; playerViewModel.submit(input) },
                     onTogglePlayback = playerViewModel::togglePlayback,
+                    onNext = { playerViewModel.dispatch(PlayerCommand.Next) },
                     onOpenPlayer = { playerOpen = true },
+                    onOpenQueue = { queueOpen = true },
                     onOpenSettings = { settingsOpen = true },
-                    updateNotice = { AppUpdateNotice(appUpdate, this@MainActivity) },
+                    updateNotice = { AppUpdateNotice(appUpdate, this@MainActivity, Modifier.fillMaxWidth()) },
+                    onDismissStatus = { dismissedStatusKey = statusKey },
                 )
                 }
+                if (queueOpen) QueueSheet(playerState, playerViewModel::dispatch) { queueOpen = false }
             }
         }
     }
