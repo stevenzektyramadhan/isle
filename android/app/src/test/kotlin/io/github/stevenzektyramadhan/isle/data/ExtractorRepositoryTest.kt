@@ -3,14 +3,96 @@ package io.github.stevenzektyramadhan.isle.data
 import io.github.stevenzektyramadhan.isle.domain.ExtractorError
 import io.github.stevenzektyramadhan.isle.Timing
 import io.github.stevenzektyramadhan.isle.model.TrackItem
+import io.github.stevenzektyramadhan.isle.model.StreamInfo
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import org.junit.Assert.*
 import org.junit.Test
 import io.github.stevenzektyramadhan.isle.data.extractor.SpotifyResolver
 
 class ExtractorRepositoryTest {
     private val anchor = TrackItem("anchor", "Song (Official)", "Artist", "https://www.youtube.com/watch?v=anchor", null)
+
+    @Test fun newPipeTimingSeparatesOutcomesWithoutLeakingDetails() = runBlocking {
+        for ((stream, failure, expected) in listOf(
+            Triple(StreamInfo("https://8.8.8.8/secret", null), false, "success"),
+            Triple(null, false, "no_results"),
+            Triple(StreamInfo("http://127.0.0.1/secret", null), false, "unusable_stream"),
+            Triple(null, true, "error"),
+        )) {
+            val lines = mutableListOf<String>()
+            val repository = ExtractorRepository(Timing({ 10L }, lines::add), newPipe = {
+                if (failure) throw IllegalStateException("secret")
+                stream
+            }) { _, _ -> """{"url":"https://8.8.8.8/fallback"}""" }
+            repository.resolveStream(anchor)
+            assertEquals("stage=stream_newpipe outcome=$expected elapsed_ms=0", lines.first())
+            assertFalse(lines.any { it.contains("secret") })
+        }
+    }
+
+    @Test fun newPipeSuccessAndFinalRecoveryUseSeparateStrategies() = runBlocking {
+        var calls = 0
+        val repository = ExtractorRepository(newPipe = { calls++; StreamInfo("https://8.8.8.8/audio", null) }) { _, _ ->
+            """{"url":"https://8.8.8.8/final"}"""
+        }
+        assertEquals(StreamStrategy.NEWPIPE, repository.resolveStream(anchor).strategy)
+        assertTrue(repository.resolveStream(anchor, finalOnly = true).finalStrategy)
+        assertEquals(1, calls)
+    }
+
+    @Test fun newPipeFailureAndUnsafeStreamFallBackToYtDlp() = runBlocking {
+        for (failure in listOf(true, false)) {
+            var calls = 0
+            val repository = ExtractorRepository(newPipe = {
+                if (failure) throw IllegalStateException("secret")
+                StreamInfo("http://127.0.0.1/private", null)
+            }) { _, _ -> calls++; """{"url":"https://8.8.8.8/fallback"}""" }
+            assertEquals(StreamStrategy.ANDROID_WEB, repository.resolveStream(anchor).strategy)
+            assertEquals(1, calls)
+        }
+    }
+
+    @Test fun newPipeCancellationNeverStartsFallback() = runBlocking {
+        var calls = 0
+        val lines = mutableListOf<String>()
+        val repository = ExtractorRepository(Timing({ 10L }, lines::add), newPipe = { throw CancellationException() }) { _, _ -> calls++; "{}" }
+        try { repository.resolveStream(anchor); fail("expected cancellation") } catch (_: CancellationException) { }
+        assertEquals(0, calls)
+        assertEquals(listOf("stage=stream_newpipe outcome=cancelled elapsed_ms=0"), lines)
+    }
+
+    @Test fun cancellingActiveNewPipeRequestNeverStartsFallback() = runBlocking {
+        val started = CompletableDeferred<Unit>()
+        var calls = 0
+        val repository = ExtractorRepository(newPipe = { started.complete(Unit); awaitCancellation() }) { _, _ -> calls++; "{}" }
+        val job = launch { repository.resolveStream(anchor) }
+        started.await()
+        job.cancelAndJoin()
+        assertEquals(0, calls)
+    }
+
+    @Test fun youtubeHostVariantsUseNewPipe() = runBlocking {
+        var calls = 0
+        val repository = ExtractorRepository(newPipe = { calls++; StreamInfo("https://8.8.8.8/audio", null) }) { _, _ -> fail("unexpected fallback"); "" }
+        for (url in listOf("https://youtube.com/watch?v=x", "https://m.youtube.com/watch?v=x", "https://youtu.be/x")) {
+            assertEquals(StreamStrategy.NEWPIPE, repository.resolveStream(anchor.copy(originalUrl = url)).strategy)
+        }
+        assertEquals(3, calls)
+    }
+
+    @Test fun nonYoutubeAndSearchTargetsNeverUseNewPipe() = runBlocking {
+        var calls = 0
+        val repository = ExtractorRepository(newPipe = { calls++; null }) { _, _ -> """{"url":"https://8.8.8.8/audio"}""" }
+        for (url in listOf("https://youtube.com.example.com/watch?v=x", "https://notyoutube.com/watch?v=x", "ytsearch1:Song Official Audio")) {
+            repository.resolveStream(anchor.copy(originalUrl = url))
+        }
+        assertEquals(0, calls)
+    }
 
     @Test fun spotifyOembedFallbackUsesExistingYoutubeSearchAndParsesItsResult() = runBlocking {
         val repository = ExtractorRepository(spotify = SpotifyResolver { url ->
@@ -40,6 +122,7 @@ class ExtractorRepositoryTest {
 
         assertTrue(repository.resolveStream(anchor).finalStrategy)
         assertEquals(listOf(
+            "stage=stream_newpipe outcome=no_results elapsed_ms=0",
             "stage=init_wait outcome=success elapsed_ms=0",
             "stage=stream_primary outcome=error elapsed_ms=0",
             "stage=init_wait outcome=success elapsed_ms=0",
