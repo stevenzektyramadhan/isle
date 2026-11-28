@@ -12,6 +12,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.session.MediaController
@@ -34,6 +35,11 @@ class PlayerEngine internal constructor(private val context: Context) {
     private val extractor = ExtractorRepository(context, scope)
     private val player = ExoPlayer.Builder(context)
         .setLooper(Looper.getMainLooper())
+        .setLoadControl(
+            DefaultLoadControl.Builder()
+                .setBufferDurationsMs(15_000, 30_000, 500, 1_000)
+                .build()
+        )
         .setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(), true)
         .setHandleAudioBecomingNoisy(true)
         .build()
@@ -41,6 +47,8 @@ class PlayerEngine internal constructor(private val context: Context) {
     private var controller: ListenableFuture<MediaController>? = null
     private var connectionGeneration = 0L
     private var visible = false
+    private var foregroundStartBlocked = false
+    private var foregroundRetry: (() -> Unit)? = null
     private var mediaGeneration = 0L
     private var mediaSequence = 0L
     private var readyStarted: Long? = null
@@ -55,7 +63,7 @@ class PlayerEngine internal constructor(private val context: Context) {
         }
         override fun install(track: TrackItem, stream: ResolvedStream, generation: Long) = installStream(track, stream, generation)
         override fun play(ready: Boolean) { android.util.Log.i("IsleTrace", "output play=$ready"); player.playWhenReady = ready }
-        override fun stop() { android.util.Log.i("IsleTrace", "output stop"); finishReadyTiming(Timing.Outcome.CANCELLED); player.stop(); player.clearMediaItems() }
+        override fun stop() { android.util.Log.i("IsleTrace", "output stop"); foregroundStartBlocked = false; finishReadyTiming(Timing.Outcome.CANCELLED); player.stop(); player.clearMediaItems() }
         override fun seekTo(seconds: Long) { player.seekTo(seconds.coerceAtMost(Long.MAX_VALUE / 1000) * 1000) }
         override fun setVolume(volume: Float) { player.volume = volume }
     }, settings = DataStoreSettings(context))
@@ -107,11 +115,17 @@ class PlayerEngine internal constructor(private val context: Context) {
     fun dispatch(command: PlayerCommand) {
         android.util.Log.i("IsleTrace", "command=${command::class.simpleName}")
         check(Looper.myLooper() == Looper.getMainLooper())
+        if (command is PlayerCommand.SubmitInput && visible && controller == null) {
+            scope.launch {
+                try { awaitSession() } catch (_: java.util.concurrent.ExecutionException) {}
+            }
+        }
         coordinator.dispatch(command)
         if (command == PlayerCommand.Stop) disconnect()
     }
 
     private fun installStream(track: TrackItem, resolved: ResolvedStream, current: Long) {
+        foregroundStartBlocked = false
         finishReadyTiming(Timing.Outcome.CANCELLED)
         val factory = DefaultHttpDataSource.Factory()
         resolved.stream.userAgent?.let { factory.setUserAgent(it) }
@@ -146,9 +160,17 @@ class PlayerEngine internal constructor(private val context: Context) {
             if (continuation.isActive) {
                 try {
                     if (connection.get().isConnected) continuation.resume(Unit)
-                    else continuation.resumeWithException(java.util.concurrent.ExecutionException(IllegalStateException("Disconnected")))
+                    else {
+                        if (attempt == connectionGeneration) disconnect()
+                        continuation.resumeWithException(java.util.concurrent.ExecutionException(IllegalStateException("Disconnected")))
+                    }
+                } catch (error: java.util.concurrent.ExecutionException) {
+                    if (attempt == connectionGeneration) disconnect()
+                    continuation.resumeWithException(error)
+                } catch (error: java.util.concurrent.CancellationException) {
+                    if (attempt == connectionGeneration) disconnect()
+                    continuation.resumeWithException(java.util.concurrent.ExecutionException(error))
                 }
-                catch (error: java.util.concurrent.ExecutionException) { continuation.resumeWithException(error) }
             }
         }, androidx.core.content.ContextCompat.getMainExecutor(context))
     }
@@ -156,6 +178,30 @@ class PlayerEngine internal constructor(private val context: Context) {
     fun setVisible(isVisible: Boolean) {
         check(Looper.myLooper() == Looper.getMainLooper())
         visible = isVisible
+        if (isVisible) {
+            retryForegroundIfBlocked()
+        } else if (foregroundStartBlocked && (player.playWhenReady || state.value.isPlaying)) {
+            foregroundStartBlocked = false
+            disconnect()
+            coordinator.unavailable("Background playback unavailable; open Isle and try again")
+        }
+    }
+
+    fun onForegroundResumed() {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        visible = true
+        retryForegroundIfBlocked()
+    }
+
+    fun setForegroundRetry(action: (() -> Unit)?) {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        foregroundRetry = action
+    }
+
+    private fun retryForegroundIfBlocked() {
+        if (!foregroundStartBlocked) return
+        foregroundStartBlocked = false
+        if (player.playWhenReady) foregroundRetry?.invoke()
     }
 
     private fun disconnect() {
@@ -167,6 +213,14 @@ class PlayerEngine internal constructor(private val context: Context) {
 
     fun foregroundStartFailed() {
         check(Looper.myLooper() == Looper.getMainLooper())
+        if (visible) {
+            // Keep in-foreground playback running when the app is visible; retry promotion on resume.
+            android.util.Log.w("IsleTrace", "Foreground service start blocked while app is visible")
+            foregroundStartBlocked = true
+            return
+        }
+        foregroundStartBlocked = false
+        disconnect()
         coordinator.unavailable("Background playback unavailable; open Isle and try again")
     }
 

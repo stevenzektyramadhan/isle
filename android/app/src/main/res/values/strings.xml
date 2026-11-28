@@ -12,6 +12,8 @@
     <string name="status_private_link_message">Local or private network addresses are blocked.</string>
     <string name="status_playback_failed_title">Could not play</string>
     <string name="status_playback_failed_message">This song could not be loaded right now.</string>
+    <string name="status_background_required_title">Playback interrupted</string>
+    <string name="status_background_required_message">Keep Isle open while loading, then try again.</string>
     <string name="status_generic_title">Something went wrong</string>
     <string name="status_autoplay_stopped_title">Autoplay stopped</string>
     <string name="status_autoplay_stopped_message">There are no more songs to play.</string>

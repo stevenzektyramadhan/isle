@@ -196,9 +196,23 @@ internal class PlaybackCoordinator(
         pendingActivation = Activation(track, nextOrigin)
         origin = nextOrigin
         publish(true)
+        // Option 1: kick off stream resolution immediately so it runs in parallel with connect().
+        // If prepared is already available (prefetch hit), skip the extra async entirely.
         try {
-            val stream = prepared ?: extractor.resolveStream(track)
-            output.connect()
+            val stream = if (prepared != null) {
+                output.connect()
+                prepared
+            } else {
+                coroutineScope {
+                    val streamDeferred = async { extractor.resolveStream(track) }
+                    output.connect()
+                    if (current != generation) {
+                        streamDeferred.cancel()
+                        throw CancellationException()
+                    }
+                    streamDeferred.await()
+                }
+            }
             if (current != generation) return
             installedGeneration = current
             output.install(track, stream, current)

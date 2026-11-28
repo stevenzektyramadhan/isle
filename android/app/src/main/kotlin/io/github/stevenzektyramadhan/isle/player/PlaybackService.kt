@@ -23,11 +23,15 @@ class PlaybackService : MediaSessionService() {
         session = MediaSession.Builder(this, (application as IsleApp).playerEngine.sessionPlayer)
             .setSessionActivity(activity)
             .build()
+        (application as IsleApp).playerEngine.setForegroundRetry {
+            session?.let { onUpdateNotification(it, true) }
+        }
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session
 
     override fun onDestroy() {
+        (application as IsleApp).playerEngine.setForegroundRetry(null)
         session?.release()
         session = null
         clearListener()

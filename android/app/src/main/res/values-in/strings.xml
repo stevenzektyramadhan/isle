@@ -12,6 +12,8 @@
     <string name="status_private_link_message">Alamat jaringan lokal atau privat diblokir.</string>
     <string name="status_playback_failed_title">Gagal memutar</string>
     <string name="status_playback_failed_message">Lagu tidak bisa dimuat sekarang.</string>
+    <string name="status_background_required_title">Pemutaran terhenti</string>
+    <string name="status_background_required_message">Biarkan Isle tetap terbuka saat memuat lagu, lalu coba lagi.</string>
     <string name="status_generic_title">Terjadi masalah</string>
     <string name="status_autoplay_stopped_title">Putar otomatis berhenti</string>
     <string name="status_autoplay_stopped_message">Tidak ada lagu lain untuk diputar.</string>
