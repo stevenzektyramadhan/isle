@@ -479,6 +479,87 @@ class PlaybackCoordinatorTest {
         coordinator.release()
     }
 
+    @Test fun autoplayLookupIsPreparedDuringPlaybackAndConsumedOnAdvance() = runBlocking {
+        var calls = 0
+        val lookupDone = CompletableDeferred<Unit>()
+        val source = ExtractorRepository { _, args ->
+            when {
+                "-j" in args -> """{"url":"https://8.8.8.8/stream"}"""
+                "-I" in args -> { calls++; lookupDone.complete(Unit); "b:::Beta:::Artist:::https://www.youtube.com/watch?v=b:::10" }
+                else -> "a:::Alpha:::Artist:::https://www.youtube.com/watch?v=a:::10"
+            }
+        }
+        val output = Output()
+        val coordinator = PlaybackCoordinator(source, this, output)
+        try {
+            coordinator.dispatch(PlayerCommand.SubmitInput("song"))
+            coordinator.settled()
+            coordinator.playingChanged(true)
+            withTimeout(5_000) { lookupDone.await() }
+            coroutineContext[Job]!!.children.toList().forEach { it.join() }
+            assertEquals("a", coordinator.state.value.currentTrack?.id)
+            coordinator.ended(coordinator.generation)
+            coordinator.settled()
+            assertEquals(listOf("a", "b"), output.installed)
+            assertEquals(1, calls)
+        } finally { coordinator.release() }
+    }
+
+    @Test fun failedRadioPrefetchReportsFailureAndRetriesOnAdvance() = runBlocking {
+        var calls = 0
+        val lines = mutableListOf<String>()
+        val source = ExtractorRepository { _, args ->
+            when {
+                "-j" in args -> """{"url":"https://8.8.8.8/stream"}"""
+                "-I" in args -> if (++calls == 1) "" else "b:::Beta:::Artist:::https://www.youtube.com/watch?v=b:::10"
+                else -> "a:::Alpha:::Artist:::https://www.youtube.com/watch?v=a:::10"
+            }
+        }
+        val output = Output()
+        val coordinator = PlaybackCoordinator(source, this, output, timing = Timing({ 0L }, lines::add))
+        try {
+            coordinator.dispatch(PlayerCommand.SubmitInput("song"))
+            coordinator.settled()
+            coordinator.playingChanged(true)
+            coroutineContext[Job]!!.children.toList().forEach { withTimeout(5_000) { it.join() } }
+            assertEquals(listOf("stage=radio_lookup outcome=no_results elapsed_ms=0", "event=prefetch outcome=failure"), lines)
+            assertFalse(coordinator.state.value.autoplayFetched)
+            coordinator.ended(coordinator.generation)
+            coordinator.settled()
+            assertEquals(2, calls)
+            assertEquals(listOf("a", "b"), output.installed)
+            assertEquals("stage=radio_lookup outcome=success elapsed_ms=0", lines.last())
+        } finally { coordinator.release() }
+    }
+
+    @Test fun cancelledRadioPreparationCannotReplaceNewSession() = runBlocking {
+        val started = CompletableDeferred<Unit>()
+        val gate = CompletableDeferred<Unit>()
+        val source = ExtractorRepository { target, args ->
+            when {
+                "-j" in args -> """{"url":"https://8.8.8.8/stream"}"""
+                "-I" in args -> withContext(NonCancellable) { started.complete(Unit); gate.await(); "b:::Beta:::Artist:::https://www.youtube.com/watch?v=b:::10" }
+                target == "ytsearch3:new" -> "c:::New:::Artist:::https://www.youtube.com/watch?v=c:::10"
+                else -> "a:::Alpha:::Artist:::https://www.youtube.com/watch?v=a:::10"
+            }
+        }
+        val output = Output()
+        val coordinator = PlaybackCoordinator(source, this, output)
+        try {
+            coordinator.dispatch(PlayerCommand.SubmitInput("song"))
+            coordinator.settled()
+            coordinator.playingChanged(true)
+            withTimeout(5_000) { started.await() }
+            coordinator.dispatch(PlayerCommand.SubmitInput("new"))
+            coordinator.settled()
+            gate.complete(Unit)
+            coroutineContext[Job]!!.children.toList().forEach { it.join() }
+            assertEquals(listOf("a", "c"), output.installed)
+            assertEquals("c", coordinator.state.value.currentTrack?.id)
+            assertTrue(coordinator.state.value.queue.isEmpty())
+        } finally { gate.complete(Unit); coordinator.release() }
+    }
+
     @Test fun prefetchedStreamIsConsumedOnlyBeforeSixtySeconds() = runBlocking {
         for ((age, expectedResolutions) in listOf(59_999L to 2, 60_000L to 3)) {
             var now = 0L
