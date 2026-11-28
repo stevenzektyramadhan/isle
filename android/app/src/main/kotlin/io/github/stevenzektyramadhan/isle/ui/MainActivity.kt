@@ -4,29 +4,39 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import androidx.activity.enableEdgeToEdge
-import androidx.activity.SystemBarStyle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.remember
-import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
-import androidx.compose.ui.Modifier
 import io.github.stevenzektyramadhan.isle.IsleApp
 import io.github.stevenzektyramadhan.isle.model.PlayerCommand
-import io.github.stevenzektyramadhan.isle.model.PlayerState
 import io.github.stevenzektyramadhan.isle.player.PlayerEngine
 
 class MainActivity : ComponentActivity() {
@@ -63,6 +73,13 @@ class MainActivity : ComponentActivity() {
             var submitCount by rememberSaveable { mutableIntStateOf(0) }
             var dismissedStatusKey by rememberSaveable { mutableStateOf("") }
             val statusKey = "${playerState.statusMessage.orEmpty()}#$submitCount"
+
+            LaunchedEffect(playerState.currentTrack) {
+                if (playerState.currentTrack == null) {
+                    playerOpen = false
+                }
+            }
+
             BackHandler(queueOpen || playerOpen || settingsOpen) {
                 when {
                     queueOpen -> queueOpen = false
@@ -70,44 +87,81 @@ class MainActivity : ComponentActivity() {
                     settingsOpen -> settingsOpen = false
                 }
             }
+
             IsleTheme {
-                if (settingsOpen) {
-                    SettingsScreen(
-                        playerState = playerState,
-                        appUpdate = appUpdate,
-                        onBack = { settingsOpen = false },
-                        modifier = Modifier.fillMaxSize(),
-                    )
-                } else if (playerOpen && playerState.currentTrack != null) {
-                    PlayerScreen(
-                        state = playerState,
-                        onCommand = playerViewModel::dispatch,
-                        onClose = { playerOpen = false },
-                        onOpenQueue = { queueOpen = true },
-                        modifier = Modifier.fillMaxSize().safeDrawingPadding(),
-                    )
-                } else {
-                HomeScreen(
-                    state = HomeUiState(
-                        input = input,
-                        isLoading = playerState.isLoading,
-                        statusMessage = playerState.statusMessage,
-                        status = playerState.status,
-                        statusDismissed = dismissedStatusKey == statusKey,
-                        player = playerState,
-                    ),
-                    onInputChange = { input = it },
-                    onSubmit = { submitCount++; dismissedStatusKey = ""; playerViewModel.submit(input) },
-                    onTogglePlayback = playerViewModel::togglePlayback,
-                    onNext = { playerViewModel.dispatch(PlayerCommand.Next) },
-                    onOpenPlayer = { playerOpen = true },
-                    onOpenQueue = { queueOpen = true },
-                    onOpenSettings = { settingsOpen = true },
-                    updateNotice = { AppUpdateNotice(appUpdate, this@MainActivity, Modifier.fillMaxWidth()) },
-                    onDismissStatus = { dismissedStatusKey = statusKey },
+                val showPlayer = playerOpen && playerState.currentTrack != null
+                val overlayActive = showPlayer || settingsOpen
+                val baseScale by animateFloatAsState(
+                    targetValue = if (overlayActive) 0.96f else 1f,
+                    animationSpec = tween(260, easing = FastOutSlowInEasing),
+                    label = "home-depth-scale",
                 )
+                val baseAlpha by animateFloatAsState(
+                    targetValue = if (overlayActive) 0.7f else 1f,
+                    animationSpec = tween(260, easing = FastOutSlowInEasing),
+                    label = "home-depth-alpha",
+                )
+
+                Box(Modifier.fillMaxSize()) {
+                    HomeScreen(
+                        state = HomeUiState(
+                            input = input,
+                            isLoading = playerState.isLoading,
+                            statusMessage = playerState.statusMessage,
+                            status = playerState.status,
+                            statusDismissed = dismissedStatusKey == statusKey,
+                            player = playerState,
+                        ),
+                        onInputChange = { input = it },
+                        onSubmit = { submitCount++; dismissedStatusKey = ""; playerViewModel.submit(input) },
+                        onTogglePlayback = playerViewModel::togglePlayback,
+                        onNext = { playerViewModel.dispatch(PlayerCommand.Next) },
+                        onPrevious = { playerViewModel.dispatch(PlayerCommand.Previous) },
+                        onOpenPlayer = { playerOpen = true },
+                        onOpenQueue = { queueOpen = true },
+                        onOpenSettings = { settingsOpen = true },
+                        updateNotice = { AppUpdateNotice(appUpdate, this@MainActivity, Modifier.fillMaxWidth()) },
+                        onDismissStatus = { dismissedStatusKey = statusKey },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                scaleX = baseScale
+                                scaleY = baseScale
+                                alpha = baseAlpha
+                            },
+                    )
+
+                    AnimatedVisibility(
+                        visible = showPlayer,
+                        enter = slideInVertically(tween(280, easing = FastOutSlowInEasing)) { it } + fadeIn(tween(220)),
+                        exit = slideOutVertically(tween(240, easing = FastOutSlowInEasing)) { it } + fadeOut(tween(180)),
+                    ) {
+                        PlayerScreen(
+                            state = playerState,
+                            onCommand = playerViewModel::dispatch,
+                            onClose = { playerOpen = false },
+                            onOpenQueue = { queueOpen = true },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+
+                    AnimatedVisibility(
+                        visible = settingsOpen,
+                        enter = slideInHorizontally(tween(260, easing = FastOutSlowInEasing)) { it } + fadeIn(tween(200)),
+                        exit = slideOutHorizontally(tween(220, easing = FastOutSlowInEasing)) { it } + fadeOut(tween(180)),
+                    ) {
+                        SettingsScreen(
+                            playerState = playerState,
+                            appUpdate = appUpdate,
+                            onBack = { settingsOpen = false },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+
+                    if (queueOpen) {
+                        QueueSheet(playerState, playerViewModel::dispatch) { queueOpen = false }
+                    }
                 }
-                if (queueOpen) QueueSheet(playerState, playerViewModel::dispatch) { queueOpen = false }
             }
         }
     }

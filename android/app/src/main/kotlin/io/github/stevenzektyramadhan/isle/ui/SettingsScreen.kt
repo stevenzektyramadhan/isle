@@ -1,15 +1,38 @@
 package io.github.stevenzektyramadhan.isle.ui
 
 import android.content.pm.PackageManager
-import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -19,9 +42,9 @@ import io.github.stevenzektyramadhan.isle.model.PlayerState
 import io.github.stevenzektyramadhan.isle.update.AppUpdateResult
 import io.github.stevenzektyramadhan.isle.update.ManualUpdateResult
 import io.github.stevenzektyramadhan.isle.update.YtDlpUpdater
+import kotlinx.coroutines.launch
 import java.text.DateFormat
 import java.util.Date
-import kotlinx.coroutines.launch
 
 @Composable
 fun SettingsScreen(
@@ -52,140 +75,242 @@ fun SettingsScreen(
 
     Surface(modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(
-            Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState())
+            Modifier
+                .fillMaxSize()
+                .safeDrawingPadding()
+                .verticalScroll(rememberScrollState())
                 .padding(horizontal = 20.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
-            // Top bar
+            // Native Top App Bar
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onBack, modifier = Modifier.size(48.dp)) {
+                IsleIconButton(onClick = onBack, modifier = Modifier.size(48.dp)) {
                     Icon(
-                        painterResource(R.drawable.ic_chevron_down),
+                        painterResource(R.drawable.ic_arrow_back),
                         contentDescription = stringResource(R.string.settings_back),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        tint = MaterialTheme.colorScheme.onSurface,
                     )
                 }
                 Spacer(Modifier.width(8.dp))
-                Text(stringResource(R.string.settings_title), style = MaterialTheme.typography.headlineMedium, color = IsleColors.textPrimary)
+                Text(
+                    stringResource(R.string.settings_title),
+                    style = MaterialTheme.typography.headlineMedium,
+                    color = MaterialTheme.colorScheme.onBackground,
+                )
             }
 
-            // About card
-            SectionCard {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(stringResource(R.string.settings_about_section), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Column(Modifier.weight(1f)) {
-                            Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineSmall, color = IsleColors.textPrimary)
+            Column(
+                Modifier.widthIn(max = 640.dp).fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(20.dp),
+            ) {
+                // About group
+                SettingsSection(title = stringResource(R.string.settings_about_section)) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(
+                                stringResource(R.string.app_name),
+                                style = MaterialTheme.typography.titleLarge,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
                             if (versionName.isNotEmpty()) {
                                 Surface(shape = CircleShape, color = MaterialTheme.colorScheme.surfaceContainerHigh) {
                                     Text(
                                         "v$versionName",
-                                        Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                                        style = MaterialTheme.typography.labelMedium,
+                                        Modifier.padding(horizontal = 10.dp, vertical = 3.dp),
+                                        style = IsleTypography.tabularDuration,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     )
                                 }
                             }
                         }
-                    }
-                    Text(stringResource(R.string.settings_description), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-
-            // Isle update card
-            SectionCard {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text(stringResource(R.string.settings_update_section), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                    OutlinedButton(
-                        onClick = { appUpdate.check(true) },
-                        enabled = !appUpdate.checking,
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                        shape = CircleShape,
-                        border = BorderStroke(1.dp, IsleColors.hairline),
-                    ) {
-                        Text(if (appUpdate.checking) stringResource(R.string.settings_checking_isle) else stringResource(R.string.settings_check_isle_update))
-                    }
-                    if (appUpdate.manual && !appUpdate.checking) {
-                        when (appUpdate.result) {
-                            AppUpdateResult.Current -> Text(stringResource(R.string.settings_isle_up_to_date), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            AppUpdateResult.Error -> Text(stringResource(R.string.settings_isle_update_error), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
-                            else -> Unit
-                        }
+                        Text(
+                            stringResource(R.string.settings_description),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
                     }
                 }
-            }
 
-            if (appUpdate.result is AppUpdateResult.Available) {
-                AppUpdateNotice(appUpdate, LocalContext.current, Modifier.fillMaxWidth())
-            }
+                // App updates group
+                SettingsSection(title = stringResource(R.string.settings_update_section)) {
+                    Column {
+                        SettingsActionRow(
+                            title = if (appUpdate.checking) stringResource(R.string.settings_checking_isle) else stringResource(R.string.settings_check_isle_update),
+                            subtitle = if (appUpdate.manual && !appUpdate.checking) {
+                                when (appUpdate.result) {
+                                    AppUpdateResult.Current -> stringResource(R.string.settings_isle_up_to_date)
+                                    AppUpdateResult.Error -> stringResource(R.string.settings_isle_update_error)
+                                    else -> null
+                                }
+                            } else null,
+                            subtitleError = appUpdate.manual && !appUpdate.checking && appUpdate.result == AppUpdateResult.Error,
+                            enabled = !appUpdate.checking,
+                            loading = appUpdate.checking,
+                            onClick = { appUpdate.check(true) },
+                        )
+                    }
+                }
 
-            // yt-dlp engine card
-            SectionCard {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                        Text(stringResource(R.string.settings_engine_section), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
-                        // Status pill: only if ytdlpAvailable is non-null
+                if (appUpdate.result is AppUpdateResult.Available) {
+                    AppUpdateNotice(appUpdate, context, Modifier.fillMaxWidth())
+                }
+
+                // Audio engine group
+                SettingsSection(
+                    title = stringResource(R.string.settings_engine_section),
+                    trailingBadge = {
                         playerState.ytdlpAvailable?.let { available ->
                             val (pillText, pillColor) = if (available)
                                 stringResource(R.string.settings_ytdlp_active) to MaterialTheme.colorScheme.primary
                             else
                                 stringResource(R.string.settings_ytdlp_unavailable) to MaterialTheme.colorScheme.error
-                            Surface(shape = CircleShape, color = pillColor.copy(alpha = 0.12f)) {
-                                Text(pillText, Modifier.padding(horizontal = 10.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium, color = pillColor)
-                            }
-                        }
-                    }
-                    Text(stringResource(R.string.settings_engine_description), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    val formattedLastCheck = remember(ytdlpLastCheckSecs) {
-                        ytdlpLastCheckSecs?.let { secs ->
-                            DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(secs * 1_000L))
-                        }
-                    }
-                    if (ytdlpVersion != null || formattedLastCheck != null) {
-                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            ytdlpVersion?.let { version ->
+                            Surface(shape = CircleShape, color = pillColor.copy(alpha = 0.14f)) {
                                 Text(
-                                    stringResource(R.string.settings_ytdlp_version, version),
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    pillText,
+                                    Modifier.padding(horizontal = 10.dp, vertical = 3.dp),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = pillColor,
                                 )
                             }
+                        }
+                    },
+                ) {
+                    Column {
+                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text(
-                                formattedLastCheck?.let { stringResource(R.string.settings_ytdlp_last_checked, it) }
-                                    ?: stringResource(R.string.settings_ytdlp_never_checked),
-                                style = MaterialTheme.typography.labelMedium,
+                                stringResource(R.string.settings_engine_description),
+                                style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                        }
-                    }
-                    FilledTonalButton(
-                        onClick = {
-                            ytdlpChecking = true
-                            ytdlpResult = null
-                            scope.launch {
-                                try {
-                                    ytdlpResult = updater.checkManually()
-                                    ytdlpVersion = updater.installedVersion()
-                                    ytdlpLastCheckSecs = updater.lastCheckEpochSecs()
-                                } finally {
-                                    ytdlpChecking = false
+                            val formattedLastCheck = remember(ytdlpLastCheckSecs) {
+                                ytdlpLastCheckSecs?.let { secs ->
+                                    DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(secs * 1_000L))
                                 }
                             }
-                        },
-                        enabled = !ytdlpChecking,
-                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
-                        shape = CircleShape,
-                    ) {
-                        Text(if (ytdlpChecking) stringResource(R.string.settings_checking_ytdlp) else stringResource(R.string.settings_check_ytdlp))
-                    }
-                    when (ytdlpResult) {
-                        ManualUpdateResult.SUCCESS -> Text(stringResource(R.string.settings_ytdlp_success), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        ManualUpdateResult.FAILURE -> Text(stringResource(R.string.settings_ytdlp_failure), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
-                        ManualUpdateResult.INTEGRATION_REQUIRED -> Text(stringResource(R.string.settings_ytdlp_integration), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        null -> Unit
+                            if (ytdlpVersion != null || formattedLastCheck != null) {
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    ytdlpVersion?.let { version ->
+                                        Text(
+                                            stringResource(R.string.settings_ytdlp_version, version),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
+                                    Text(
+                                        formattedLastCheck?.let { stringResource(R.string.settings_ytdlp_last_checked, it) }
+                                            ?: stringResource(R.string.settings_ytdlp_never_checked),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                        HorizontalDivider(color = IsleColors.divider)
+                        SettingsActionRow(
+                            title = if (ytdlpChecking) stringResource(R.string.settings_checking_ytdlp) else stringResource(R.string.settings_check_ytdlp),
+                            subtitle = when (ytdlpResult) {
+                                ManualUpdateResult.SUCCESS -> stringResource(R.string.settings_ytdlp_success)
+                                ManualUpdateResult.FAILURE -> stringResource(R.string.settings_ytdlp_failure)
+                                ManualUpdateResult.INTEGRATION_REQUIRED -> stringResource(R.string.settings_ytdlp_integration)
+                                null -> null
+                            },
+                            subtitleError = ytdlpResult == ManualUpdateResult.FAILURE,
+                            enabled = !ytdlpChecking,
+                            loading = ytdlpChecking,
+                            onClick = {
+                                ytdlpChecking = true
+                                ytdlpResult = null
+                                scope.launch {
+                                    try {
+                                        ytdlpResult = updater.checkManually()
+                                        ytdlpVersion = updater.installedVersion()
+                                        ytdlpLastCheckSecs = updater.lastCheckEpochSecs()
+                                    } finally {
+                                        ytdlpChecking = false
+                                    }
+                                }
+                            },
+                        )
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun SettingsSection(
+    title: String,
+    trailingBadge: (@Composable () -> Unit)? = null,
+    content: @Composable () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                title,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            trailingBadge?.invoke()
+        }
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = MaterialTheme.shapes.large,
+            color = MaterialTheme.colorScheme.surfaceContainer,
+        ) {
+            content()
+        }
+    }
+}
+
+@Composable
+private fun SettingsActionRow(
+    title: String,
+    subtitle: String?,
+    subtitleError: Boolean,
+    enabled: Boolean,
+    loading: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .defaultMinSize(minHeight = 56.dp)
+            .clip(MaterialTheme.shapes.large)
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(Modifier.weight(1f).padding(end = 12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                title,
+                style = MaterialTheme.typography.titleSmall,
+                color = if (enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (subtitle != null) {
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (subtitleError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        if (loading) {
+            CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = MaterialTheme.colorScheme.primary)
+        } else {
+            Icon(
+                painterResource(R.drawable.ic_refresh),
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(20.dp),
+            )
         }
     }
 }
