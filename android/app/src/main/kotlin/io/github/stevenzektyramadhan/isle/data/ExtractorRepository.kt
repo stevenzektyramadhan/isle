@@ -10,6 +10,7 @@ import io.github.stevenzektyramadhan.isle.model.*
 import io.github.stevenzektyramadhan.isle.update.YtDlpUpdater
 import io.github.stevenzektyramadhan.isle.update.YtDlpExecutionGate
 import io.github.stevenzektyramadhan.isle.data.extractor.SpotifyResolver
+import io.github.stevenzektyramadhan.isle.data.extractor.YouTubeSearch
 import java.net.URI
 import java.util.UUID
 import kotlinx.coroutines.*
@@ -52,14 +53,25 @@ class ExtractorRepository private constructor(
 
     suspend fun resolveInput(input: String): TrackItem = resolveInputs(input).first()
 
+    private suspend fun searchFirstTrack(query: String): List<TrackItem> {
+        if (invocation == null) {
+            try {
+                YouTubeSearch.searchFirst(query)?.let { return listOf(it) }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                // Fall back to yt-dlp search if direct HTTP search fails.
+            }
+        }
+        return listOfNotNull(run("ytsearch3:$query", listOf("--flat-playlist", "--match-filter", "live_status!=is_live", "--print", SEARCH_FORMAT)).lineSequence().mapNotNull(::parseMetadataLine).firstOrNull())
+    }
+
     suspend fun resolveInputs(input: String): List<TrackItem> = timing.measure(Timing.Stage.METADATA) { withContext(Dispatchers.IO) {
         when (val kind = InputClassifier.classify(input)) {
-            is InputKind.SearchQuery -> listOfNotNull(run("ytsearch3:${kind.value}", listOf("--flat-playlist", "--match-filter", "live_status!=is_live", "--print", SEARCH_FORMAT)).lineSequence().mapNotNull(::parseMetadataLine).firstOrNull())
+            is InputKind.SearchQuery -> searchFirstTrack(kind.value)
             is InputKind.DirectUrl -> listOfNotNull(run(kind.value, listOf("--no-playlist", "--print", METADATA_FORMAT)).lineSequence().mapNotNull(::parseMetadataLine).firstOrNull())
             is InputKind.YouTubePlaylist -> run(kind.value, listOf("--flat-playlist", "--playlist-end", "200", "--print", PLAYLIST_FORMAT)).lineSequence().mapNotNull(::parseFlatPlaylistLine).take(200).toList()
-            is InputKind.SpotifyUrl -> spotify.resolve(kind.value) { query ->
-                listOfNotNull(run("ytsearch3:$query", listOf("--flat-playlist", "--match-filter", "live_status!=is_live", "--print", SEARCH_FORMAT)).lineSequence().mapNotNull(::parseMetadataLine).firstOrNull())
-            }
+            is InputKind.SpotifyUrl -> spotify.resolve(kind.value) { query -> searchFirstTrack(query) }
         }.ifEmpty { throw ExtractorError.NoResults }
     } }
 

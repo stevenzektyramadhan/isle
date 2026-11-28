@@ -18,6 +18,7 @@ fun mapStatus(status: PlayerStatus): UiStatus = when (status.code) {
     PlayerStatusCode.UNSUPPORTED_INPUT -> UiStatus(StatusSeverity.Info, R.string.status_unsupported_title, R.string.status_unsupported_message, setOf(StatusAction.Dismiss))
     PlayerStatusCode.PRIVATE_NETWORK_BLOCKED -> UiStatus(StatusSeverity.Error, R.string.status_private_link_title, R.string.status_private_link_message, setOf(StatusAction.Dismiss))
     PlayerStatusCode.PLAYBACK_FAILED -> UiStatus(StatusSeverity.Error, R.string.status_playback_failed_title, R.string.status_playback_failed_message, setOf(StatusAction.Dismiss, StatusAction.Retry))
+    PlayerStatusCode.BACKGROUND_REQUIRED -> UiStatus(StatusSeverity.Error, R.string.status_background_required_title, R.string.status_background_required_message, setOf(StatusAction.Dismiss, StatusAction.Retry))
     PlayerStatusCode.AUTOPLAY_STOPPED -> UiStatus(StatusSeverity.Info, R.string.status_autoplay_stopped_title, R.string.status_autoplay_stopped_message, setOf(StatusAction.Dismiss))
     PlayerStatusCode.YTDLP_UPDATE_FAILED -> UiStatus(StatusSeverity.Error, R.string.status_engine_update_failed_title, R.string.status_engine_update_failed_message, setOf(StatusAction.Dismiss))
     PlayerStatusCode.UNKNOWN -> UiStatus(StatusSeverity.Error, R.string.status_generic_title, null, setOf(StatusAction.Dismiss), detail = status.message)

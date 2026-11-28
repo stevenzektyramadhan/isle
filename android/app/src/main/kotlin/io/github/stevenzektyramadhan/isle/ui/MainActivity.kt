@@ -47,8 +47,8 @@ class MainActivity : ComponentActivity() {
         setContent {
             val playerState by playerViewModel.state.collectAsStateWithLifecycle()
             var notificationPrompted by rememberSaveable { mutableStateOf(false) }
-            LaunchedEffect(playerState.isPlaying) {
-                if (playerState.isPlaying && !notificationPrompted) {
+            LaunchedEffect(playerState.isLoading, playerState.isPlaying) {
+                if ((playerState.isLoading || playerState.isPlaying) && !notificationPrompted) {
                     notificationPrompted = true
                     if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                         notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -117,6 +117,11 @@ class MainActivity : ComponentActivity() {
         playerViewModel.setVisible(true)
     }
 
+    override fun onResume() {
+        super.onResume()
+        playerViewModel.onForegroundResumed()
+    }
+
     override fun onStop() {
         playerViewModel.setVisible(false)
         super.onStop()
@@ -135,6 +140,7 @@ class PlayerViewModel(private val engine: PlayerEngine) : ViewModel() {
     }
 
     fun setVisible(visible: Boolean) = engine.setVisible(visible)
+    fun onForegroundResumed() = engine.onForegroundResumed()
 
     class Factory(private val engine: PlayerEngine) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")

@@ -7,6 +7,7 @@ enum class PlayerStatusCode {
     UNSUPPORTED_INPUT,
     PRIVATE_NETWORK_BLOCKED,
     PLAYBACK_FAILED,
+    BACKGROUND_REQUIRED,
     AUTOPLAY_STOPPED,
     YTDLP_UPDATE_FAILED,
     UNKNOWN,
@@ -21,7 +22,8 @@ fun classifyPlayerStatus(message: String): PlayerStatus {
         "No tracks found" -> PlayerStatusCode.NO_TRACKS_FOUND
         "This input is not supported yet" -> PlayerStatusCode.UNSUPPORTED_INPUT
         "Private network addresses are not allowed" -> PlayerStatusCode.PRIVATE_NETWORK_BLOCKED
-        "Extraction failed", "Stream failed", "Playback failed", "Playback service unavailable", "Autoplay lookup failed", "Playback stopped: repeated errors" -> PlayerStatusCode.PLAYBACK_FAILED
+        "Extraction failed", "Stream failed", "Playback failed", "Playback service unavailable", "Playback service disconnected", "Autoplay lookup failed", "Playback stopped: repeated errors" -> PlayerStatusCode.PLAYBACK_FAILED
+        "Background playback unavailable; open Isle and try again" -> PlayerStatusCode.BACKGROUND_REQUIRED
         "Autoplay disabled", "Autoplay exhausted" -> PlayerStatusCode.AUTOPLAY_STOPPED
         "yt-dlp update failed" -> PlayerStatusCode.YTDLP_UPDATE_FAILED
         else -> PlayerStatusCode.UNKNOWN

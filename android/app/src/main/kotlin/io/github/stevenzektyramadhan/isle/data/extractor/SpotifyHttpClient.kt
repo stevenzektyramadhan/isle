@@ -10,6 +10,8 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.*
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import okio.Buffer
 
 internal class UnsafeSpotifyAddress : UnknownHostException("Private network addresses are not allowed")
@@ -47,17 +49,29 @@ internal class SpotifyHttpClient(
         .readTimeout(5, TimeUnit.SECONDS)
         .build()
 
-    suspend fun get(raw: String): String = withTimeoutOrNull(5_000) {
+    suspend fun get(raw: String): String = execute(raw) { url ->
+        Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build()
+    }
+
+    suspend fun postJson(raw: String, jsonBody: String): String = execute(raw) { url ->
+        Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0")
+            .post(jsonBody.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+    }
+
+    private suspend fun execute(raw: String, buildRequest: (HttpUrl) -> Request): String = withTimeoutOrNull(5_000) {
         var url = raw.toHttpUrlOrNull() ?: throw ExtractorError.Failed
         repeat(11) { hop ->
             if (url.username.isNotEmpty() || url.password.isNotEmpty()) throw ExtractorError.Failed
             // Numeric hosts bypass OkHttp DNS; validate them here as well.
             val host = url.host.lowercase().trimEnd('.')
-            if (host == "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) throw ExtractorError.PrivateNetwork
+            if (host == "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.isInInternalDomain()) throw ExtractorError.PrivateNetwork
             if (host.contains(':') || host.all { it.isDigit() || it == '.' }) {
                 try { dns.lookup(host) } catch (_: UnsafeSpotifyAddress) { throw ExtractorError.PrivateNetwork }
             }
-            val response = request(Request.Builder().url(url).header("User-Agent", "Mozilla/5.0").build())
+            val response = request(buildRequest(url))
             if (response.code in listOf(301, 302, 303, 307, 308)) {
                 if (hop == 10) throw ExtractorError.Failed
                 url = response.location?.let(url::resolve) ?: throw ExtractorError.Failed
@@ -68,6 +82,9 @@ internal class SpotifyHttpClient(
         }
         throw ExtractorError.Failed
     } ?: throw ExtractorError.Timeout
+
+    private fun String.isInInternalDomain(): Boolean =
+        this == "localhost" || endsWith(".localhost") || endsWith(".local") || endsWith(".internal")
 
     private data class Result(val code: Int, val location: String?, val body: String)
 
