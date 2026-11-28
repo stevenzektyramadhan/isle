@@ -11,7 +11,7 @@ internal class Timing(
     private val clock: () -> Long,
     private val sink: (String) -> Unit,
 ) {
-    enum class Stage { INIT_WAIT, METADATA, STREAM_PRIMARY, STREAM_FINAL, SERVICE_CONNECTION, PLAYER_READY, RADIO_LOOKUP }
+    enum class Stage { INIT_WAIT, METADATA, STREAM_NEWPIPE, STREAM_PRIMARY, STREAM_FINAL, SERVICE_CONNECTION, PLAYER_READY, RADIO_LOOKUP }
     enum class Outcome { SUCCESS, ERROR, CANCELLED, NO_RESULTS, UNUSABLE_STREAM }
     enum class PrefetchOutcome { HIT, MISS, FAILURE }
 

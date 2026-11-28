@@ -2,6 +2,14 @@
 
 This guide covers the Android app under `android/`. The Android module targets SDK 36, supports `arm64-v8a` and `x86_64`, and compiles Kotlin and Java bytecode for JDK 17. Android release tags build signed APKs for both ABIs. Device behavior and live Spotify/autoplay have not been verified end to end.
 
+## Licensing
+
+The original Isle project is licensed under the MIT License in the repository root `LICENSE`. The Android app also includes NewPipe Extractor `v0.27.1` (`com.github.TeamNewPipe:NewPipeExtractor`), which is licensed under the GNU General Public License, version 3 or any later version (GPL-3.0-or-later). Because the Android app combines this library with Isle code, distribution of the combined Android app is subject to the GPL terms. The root `LICENSE` continues to describe the license for Isle's original code; it does not replace or relicense NewPipe Extractor, and the desktop project remains MIT-licensed.
+
+NewPipe Extractor is developed by Team NewPipe. Preserve its copyright and license notices when redistributing the app, and provide recipients the GPL license text and the Corresponding Source for the distributed combined Android work as required by the GPL. For APK distribution, make the source available through the same download location as the APK or provide clear directions to equivalent source access, and keep it available as long as required by the GPL. The Corresponding Source includes the source and build/install scripts needed to generate, install, and run the distributed Android app. The canonical GPL-3.0 text is in [`LICENSE-GPL-3.0`](LICENSE-GPL-3.0), and NewPipe Extractor's source and notices are at [TeamNewPipe/NewPipeExtractor](https://github.com/TeamNewPipe/NewPipeExtractor/tree/v0.27.1).
+
+This documentation describes the project's licensing and distribution intent; it is not legal advice or a certification of compliance.
+
 ## Requirements
 
 - JDK 17

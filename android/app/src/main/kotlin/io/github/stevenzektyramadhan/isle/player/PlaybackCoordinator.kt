@@ -33,6 +33,7 @@ internal class PlaybackCoordinator(
     private val preparation = NextTrackPreparation<ResolvedStream>(nowMillis)
     private var job: Job? = null
     private var prefetch: Job? = null
+    private var preparedRadio: Pair<TrackItem, List<TrackItem>>? = null
     private var playWhenReady = false
     private var intentVersion = 0L
     private var origin: QueueManager.Origin = QueueManager.Origin.Manual
@@ -103,6 +104,7 @@ internal class PlaybackCoordinator(
 
     private fun applyAutoplay(enabled: Boolean) {
         mutableState.update { it.copy(autoplayEnabled = enabled) }
+        if (!enabled) invalidatePreparation() else prepareNext()
         if (!enabled && queue.current == null && state.value.isLoading) { invalidate(); halt("Autoplay disabled") }
     }
 
@@ -154,6 +156,7 @@ internal class PlaybackCoordinator(
     }
 
     private fun advance(nextOrigin: QueueManager.Origin) {
+        val radio = preparedRadio
         val prepared = queue.queue.firstOrNull()?.let { track ->
             preparation.take(track).also {
                 timing.prefetch(if (it == null) Timing.PrefetchOutcome.MISS else Timing.PrefetchOutcome.HIT)
@@ -163,15 +166,15 @@ internal class PlaybackCoordinator(
         if (nextOrigin == QueueManager.Origin.Manual) playWhenReady = true
         val action = queue.advance(nextOrigin, state.value.autoplayEnabled)
         publish(true)
-        job = scope.launch { handleAdvance(action, nextOrigin, current, prepared) }
+        job = scope.launch { handleAdvance(action, nextOrigin, current, prepared, radio) }
     }
 
-    private suspend fun handleAdvance(action: QueueManager.Advance, nextOrigin: QueueManager.Origin, current: Long, prepared: ResolvedStream? = null) {
+    private suspend fun handleAdvance(action: QueueManager.Advance, nextOrigin: QueueManager.Origin, current: Long, prepared: ResolvedStream? = null, radio: Pair<TrackItem, List<TrackItem>>? = null) {
         if (current != generation) return
         when (action) {
             is QueueManager.Advance.Play -> activate(action.track, action.origin, current, prepared)
             is QueueManager.Advance.Fetch -> {
-                val result = try { QueueManager.Related.Tracks(timing.measure(Timing.Stage.RADIO_LOOKUP) { extractor.fetchRelated(action.anchor) }) }
+                val result = try { QueueManager.Related.Tracks(if (radio?.first == action.anchor) radio.second else timing.measure(Timing.Stage.RADIO_LOOKUP) { extractor.fetchRelated(action.anchor) }) }
                 catch (_: ExtractorError.NoResults) { QueueManager.Related.NoResults }
                 catch (_: ExtractorError) { QueueManager.Related.Failure }
                 if (current != generation) return
@@ -297,7 +300,20 @@ internal class PlaybackCoordinator(
 
     private fun prepareNext() {
         if (!state.value.isPlaying || state.value.isLoading) return
-        val attempt = preparation.prepare(queue.queue.firstOrNull(), state.value.isPlaying && !state.value.isLoading) ?: return
+        val head = queue.queue.firstOrNull()
+        if (head == null && state.value.autoplayEnabled && !queue.autoplayFetched) {
+            val anchor = queue.anchor ?: return
+            if (prefetch?.isActive == true || preparedRadio?.first == anchor) return
+            prefetch = scope.launch {
+                try {
+                    val tracks = timing.measure(Timing.Stage.RADIO_LOOKUP) { extractor.fetchRelated(anchor) }
+                    ensureActive()
+                    preparedRadio = anchor to tracks
+                } catch (_: ExtractorError) { timing.prefetch(Timing.PrefetchOutcome.FAILURE) }
+            }
+            return
+        }
+        val attempt = preparation.prepare(head, true) ?: return
         prefetch?.cancel()
         prefetch = scope.launch {
             try { preparation.complete(attempt, extractor.resolveStream(attempt.track)) }
@@ -305,7 +321,7 @@ internal class PlaybackCoordinator(
         }
     }
 
-    private fun invalidatePreparation() { prefetch?.cancel(); preparation.invalidate() }
+    private fun invalidatePreparation() { prefetch?.cancel(); prefetch = null; preparedRadio = null; preparation.invalidate() }
     private fun acceptsInstalled(current: Long) = current >= 0 && current == installedGeneration && (current == generation || current == retainedInstalledGeneration)
     private fun invalidate(): Long { generation++; retainedInstalledGeneration = null; pendingActivation = null; pendingInputGeneration = null; pendingEndGeneration = null; job?.cancel(); invalidatePreparation(); return generation }
     private fun halt(message: String?) { installedGeneration = -1L; retainedInstalledGeneration = null; pendingActivation = null; playWhenReady = false; output.stop(); mutableState.update { it.copy(isPlaying = false, elapsedSecs = 0, durationSecs = null) }; publish(false, message) }

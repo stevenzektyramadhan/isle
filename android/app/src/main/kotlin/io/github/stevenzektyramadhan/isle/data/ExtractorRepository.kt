@@ -11,6 +11,7 @@ import io.github.stevenzektyramadhan.isle.update.YtDlpUpdater
 import io.github.stevenzektyramadhan.isle.update.YtDlpExecutionGate
 import io.github.stevenzektyramadhan.isle.data.extractor.SpotifyResolver
 import io.github.stevenzektyramadhan.isle.data.extractor.YouTubeSearch
+import io.github.stevenzektyramadhan.isle.data.extractor.NewPipeResolver
 import java.net.URI
 import java.util.UUID
 import kotlinx.coroutines.*
@@ -21,6 +22,7 @@ private const val PLAYLIST_FORMAT = "%(id)s:::%(title)s:::%(url)s"
 private const val STREAM_FORMAT = "ba[ext=m4a][protocol^=http]/ba[ext=mp3][protocol^=http]/ba[acodec^=vorbis][protocol^=http]/ba[protocol^=http]/b[protocol^=http]"
 
 enum class StreamStrategy(val clients: String) {
+    NEWPIPE(""),
     ANDROID_WEB("android,web"),
     VISIONOS_DEFAULT("visionos,default"),
 }
@@ -35,6 +37,7 @@ class ExtractorRepository private constructor(
     private val invocation: (suspend (String, List<String>) -> String)?,
     private val timing: Timing,
     private val spotify: SpotifyResolver = SpotifyResolver(),
+    private val newPipe: suspend (String) -> StreamInfo? = NewPipeResolver::resolve,
 ) {
     private constructor(context: Context, scope: CoroutineScope, available: BooleanArray) : this(scope.async(Dispatchers.IO) {
         try {
@@ -47,7 +50,7 @@ class ExtractorRepository private constructor(
 
     constructor(context: Context, scope: CoroutineScope) : this(context, scope, booleanArrayOf(false))
 
-    internal constructor(timing: Timing = Timing({ System.nanoTime() / 1_000_000 }, {}), spotify: SpotifyResolver = SpotifyResolver(), invocation: suspend (String, List<String>) -> String) : this(CompletableDeferred(Unit), { true }, invocation, timing, spotify)
+    internal constructor(timing: Timing = Timing({ System.nanoTime() / 1_000_000 }, {}), spotify: SpotifyResolver = SpotifyResolver(), newPipe: suspend (String) -> StreamInfo? = { null }, invocation: suspend (String, List<String>) -> String) : this(CompletableDeferred(Unit), { true }, invocation, timing, spotify, newPipe)
 
     suspend fun isAvailable(): Boolean { ready.await(); return availability() }
 
@@ -96,12 +99,33 @@ class ExtractorRepository private constructor(
 
     suspend fun resolveStream(track: TrackItem, finalOnly: Boolean = false): ResolvedStream {
         withContext(Dispatchers.IO) { InputClassifier.classify(track.originalUrl) }
+        val host = try { URI(track.originalUrl).host?.lowercase(java.util.Locale.ROOT)?.trimEnd('.') } catch (_: java.net.URISyntaxException) { null }
+        if (!finalOnly && (host == "youtu.be" || host == "youtube.com" || host?.endsWith(".youtube.com") == true)) {
+            val started = timing.start()
+            var outcome = Timing.Outcome.ERROR
+            try {
+                val stream = newPipe(track.originalUrl)
+                if (stream != null) {
+                    outcome = Timing.Outcome.UNUSABLE_STREAM
+                    withContext(Dispatchers.IO) { InputClassifier.validateStreamUrl(stream.url) }
+                    outcome = Timing.Outcome.SUCCESS
+                    return ResolvedStream(stream, StreamStrategy.NEWPIPE)
+                }
+                outcome = Timing.Outcome.NO_RESULTS
+            } catch (error: CancellationException) { outcome = Timing.Outcome.CANCELLED; throw error }
+            catch (_: Exception) {
+                if (!currentCoroutineContext().isActive) outcome = Timing.Outcome.CANCELLED
+                currentCoroutineContext().ensureActive()
+            }
+            finally { timing.record(Timing.Stage.STREAM_NEWPIPE, outcome, started) }
+        }
         val common = listOf("-j", "-f", STREAM_FORMAT, "--no-playlist")
         var lastError: ExtractorError? = null
         // finalOnly is the one remaining strategy after an initial playback 403.
-        val strategies = if (finalOnly) listOf(StreamStrategy.VISIONOS_DEFAULT) else StreamStrategy.entries
+        val strategies = if (finalOnly) listOf(StreamStrategy.VISIONOS_DEFAULT) else listOf(StreamStrategy.ANDROID_WEB, StreamStrategy.VISIONOS_DEFAULT)
         for (strategy in strategies) {
             val stage = when (strategy) {
+                StreamStrategy.NEWPIPE -> error("NewPipe is resolved separately")
                 StreamStrategy.ANDROID_WEB -> Timing.Stage.STREAM_PRIMARY
                 StreamStrategy.VISIONOS_DEFAULT -> Timing.Stage.STREAM_FINAL
             }
