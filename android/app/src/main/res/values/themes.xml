@@ -1,5 +1,5 @@
 <resources>
     <style name="Theme.Isle" parent="@android:style/Theme.Material.NoActionBar">
-        <item name="android:windowBackground">#101419</item>
+        <item name="android:windowBackground">#121214</item>
     </style>
 </resources>
